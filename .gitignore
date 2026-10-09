@@ -1,0 +1,8 @@
+tokens.json
+.env
+null.txt
+__pycache__/
+*.pyc
+.DS_Store
+*.db
+forward_test.db
