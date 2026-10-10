@@ -6,3 +6,5 @@ __pycache__/
 .DS_Store
 *.db
 forward_test.db
+schwab_refresh_token
+live_view.json

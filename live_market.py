@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import math
+import os
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -24,6 +25,38 @@ from event_calendar import EASTERN
 MARKET_BASE = "https://api.schwabapi.com/marketdata/v1"
 TOKEN_URL = "https://api.schwabapi.com/v1/oauth/token"
 TOKEN_AGE_SECONDS = 28 * 60
+
+
+def _refresh_token_path():
+    from pathlib import Path
+
+    raw = os.environ.get("SCHWAB_REFRESH_TOKEN_PATH", "")
+    return Path(raw) if raw else None
+
+
+def _read_refresh_token(path) -> str:
+    if path is None or not path.is_file():
+        return ""
+    return path.read_text().strip()
+
+
+def _write_refresh_token(path, token: str) -> None:
+    if path is None or not token:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(token + "\n")
+    path.chmod(0o600)
+
+
+def _auth_error(response: requests.Response) -> str:
+    try:
+        body = response.json()
+    except ValueError:
+        return "unreadable response"
+    if not isinstance(body, dict):
+        return "unexpected response"
+    detail = body.get("error_description") or body.get("error") or "request rejected"
+    return " ".join(str(detail).split())[:180]
 
 
 class MarketDataError(RuntimeError):
@@ -49,6 +82,10 @@ class SchwabSession:
         self.refresh_token = refresh_token
         self.access_token: str | None = None
         self.token_expiry = 0.0
+        self.refresh_token_path = _refresh_token_path()
+        stored = _read_refresh_token(self.refresh_token_path)
+        if stored:
+            self.refresh_token = stored
         self.http = requests.Session()
 
     def _authenticate(self) -> None:
@@ -73,12 +110,16 @@ class SchwabSession:
         except RequestException as exc:
             raise MarketDataError(f"token request failed: {exc.__class__.__name__}") from exc
         if response.status_code != 200:
-            raise AuthError(f"Schwab auth failed ({response.status_code})")
+            raise AuthError(f"Schwab auth failed ({response.status_code}): {_auth_error(response)}")
         payload = response.json()
         token = payload.get("access_token")
         if not token:
             raise AuthError("Schwab auth response did not include an access token")
         self.access_token = str(token)
+        rotated = payload.get("refresh_token")
+        if rotated:
+            self.refresh_token = str(rotated)
+            _write_refresh_token(self.refresh_token_path, self.refresh_token)
         self.token_expiry = time.time() + TOKEN_AGE_SECONDS
 
     def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -211,6 +252,29 @@ def np_dates(index: pd.DatetimeIndex, session_day: date):
     import numpy as np
 
     return np.array([stamp.date() == session_day for stamp in index])
+
+
+def fetch_near_term_gex(client: SchwabSession, symbol: str, session_day: date, spot: float) -> float:
+    """Net GEX of the 0 DTE and 1 DTE books. Gamma × OI × 100 × spot."""
+    payload = client.option_chain(
+        symbol,
+        start=session_day,
+        end=session_day + timedelta(days=4),
+        strike_count=30,
+    )
+    total = 0.0
+    found = False
+    for _exp, dte, contract in _iter_contracts(payload):
+        if dte is None or dte < 0 or dte > 1:
+            continue
+        found = True
+        gamma = _number(contract.get("gamma"))
+        oi = _number(contract.get("openInterest"))
+        sign = 1.0 if str(contract.get("putCall") or "").upper() == "CALL" else -1.0
+        total += sign * gamma * oi * 100.0 * float(spot)
+    if not found:
+        raise MarketDataError(f"no 0–1 DTE contracts for {session_day.isoformat()}")
+    return total
 
 
 def fetch_intraday_chain(client: SchwabSession, symbol: str, session_day: date) -> pd.DataFrame:

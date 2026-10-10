@@ -38,6 +38,7 @@ class EntrySignal:
     structure: str
     anchor: float
     reason: str
+    stop: float | None = None
 
 
 def ornstein_uhlenbeck(prices: np.ndarray | pd.Series) -> tuple[float, float, float] | None:
@@ -181,6 +182,10 @@ def absorption_signal(
     put_wall: float | None,
     upper_2: float,
     lower_2: float,
+    upper_1: float = float("nan"),
+    lower_1: float = float("nan"),
+    call_wall_2: float | None = None,
+    put_wall_2: float | None = None,
     cdf_now: float | None,
     cdf_prev: float | None,
     iv_now: float | None,
@@ -197,10 +202,14 @@ def absorption_signal(
     candidates: list[tuple[str, float, str]] = []
     if put_wall is not None and _failed_down(bar, put_wall):
         candidates.append(("bullish", put_wall, "put wall"))
+    if np.isfinite(lower_1) and _failed_down(bar, lower_1):
+        candidates.append(("bullish", lower_1, "lower 1σ"))
     if np.isfinite(lower_2) and _failed_down(bar, lower_2):
         candidates.append(("bullish", lower_2, "lower 2σ"))
     if call_wall is not None and _failed_up(bar, call_wall):
         candidates.append(("bearish", call_wall, "call wall"))
+    if np.isfinite(upper_1) and _failed_up(bar, upper_1):
+        candidates.append(("bearish", upper_1, "upper 1σ"))
     if np.isfinite(upper_2) and _failed_up(bar, upper_2):
         candidates.append(("bearish", upper_2, "upper 2σ"))
     if not candidates:
@@ -214,12 +223,18 @@ def absorption_signal(
     if not _cdf_supports_fade(direction, float(cdf_now), float(cdf_prev)):
         return None
     structure = "put_credit" if direction == "bullish" else "call_credit"
+    stop = None
+    if "1σ" in label:
+        outer = put_wall_2 if direction == "bullish" else call_wall_2
+        if outer is not None:
+            stop = float(outer)
     return EntrySignal(
         strategy="absorption",
         direction=direction,
         structure=structure,
         anchor=float(anchor),
         reason=f"5-minute test of {label} failed, CDF diverged, ATM IV stable",
+        stop=stop,
     )
 
 
@@ -242,6 +257,8 @@ def cascade_signal(
     call_wall: float | None,
     put_wall: float | None,
     zero_gamma: float | None,
+    call_wall_2: float | None = None,
+    put_wall_2: float | None = None,
     vwap: float,
     cdf_now: float | None,
     cdf_15: float | None,
@@ -263,14 +280,22 @@ def cascade_signal(
     prior_change = float(cdf_15) - float(cdf_30)
     upside: list[tuple[float, str]] = []
     downside: list[tuple[float, str]] = []
-    if call_wall is not None and _broke_up(previous, bar, call_wall):
-        upside.append((call_wall, "call wall"))
-    if zero_gamma is not None and _broke_up(previous, bar, zero_gamma):
-        upside.append((zero_gamma, "zero gamma"))
-    if put_wall is not None and _broke_down(previous, bar, put_wall):
-        downside.append((put_wall, "put wall"))
-    if zero_gamma is not None and _broke_down(previous, bar, zero_gamma):
-        downside.append((zero_gamma, "zero gamma"))
+    if call_wall_2 is not None:
+        if _broke_up(previous, bar, call_wall_2):
+            upside.append((call_wall_2, "secondary call wall"))
+    else:
+        if call_wall is not None and _broke_up(previous, bar, call_wall):
+            upside.append((call_wall, "call wall"))
+        if zero_gamma is not None and _broke_up(previous, bar, zero_gamma):
+            upside.append((zero_gamma, "zero gamma"))
+    if put_wall_2 is not None:
+        if _broke_down(previous, bar, put_wall_2):
+            downside.append((put_wall_2, "secondary put wall"))
+    else:
+        if put_wall is not None and _broke_down(previous, bar, put_wall):
+            downside.append((put_wall, "put wall"))
+        if zero_gamma is not None and _broke_down(previous, bar, zero_gamma):
+            downside.append((zero_gamma, "zero gamma"))
 
     if upside and bar["Close"] > vwap and latest_change > 0 and latest_change > prior_change:
         anchor, label = upside[0]

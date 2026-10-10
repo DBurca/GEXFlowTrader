@@ -1,24 +1,47 @@
 """
-Intraday VWAP and cumulative-volatility bands.
+Session VWAP and the expected-move bands the forward test publishes.
 
-VWAP starts at 09:30 ET. The 1σ and 2σ bands use the expanding standard
-deviation of 1-minute returns, scaled by sqrt(minutes elapsed) so the width
-is the cumulative move associated with those returns:
+VWAP starts at 09:30 ET. The levels drawn on the dashboard are
 
-    σ_t = std(r_1 ... r_t)
-    band_t = VWAP_t * (1 ± k * σ_t * sqrt(t))
+    width = spot × ATM IV × sqrt(1/252)
+    band  = VWAP ± k × width
+
+``calculate_vwap_bands`` still attaches a return-volatility width. The
+forward test replaces those four band columns with ``expected_move_bands``.
 """
 
 from __future__ import annotations
 
+import math
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 
+TRADING_DAYS = 252
+
 EASTERN = ZoneInfo("America/New_York")
 RTH_OPEN_MINUTES = 9 * 60 + 30
 RTH_CLOSE_MINUTES = 16 * 60
+
+
+def expected_move(spot: float, atm_iv: float) -> float:
+    """One-day one-sigma move: spot × ATM IV × sqrt(1/252).
+
+    ``atm_iv`` is a decimal (0.10 for 10 percent), not a percent.
+    """
+    if not np.isfinite(spot) or not np.isfinite(atm_iv) or spot <= 0 or atm_iv <= 0:
+        return float("nan")
+    return float(spot) * float(atm_iv) * math.sqrt(1.0 / TRADING_DAYS)
+
+
+def expected_move_bands(vwap: float, spot: float, atm_iv: float) -> tuple[float, float, float, float]:
+    """VWAP ± 1 and ± 2 expected moves. Returns upper_1, lower_1, upper_2, lower_2."""
+    width = expected_move(spot, atm_iv)
+    if not np.isfinite(vwap) or not np.isfinite(width):
+        nan = float("nan")
+        return nan, nan, nan, nan
+    return vwap + width, vwap - width, vwap + 2.0 * width, vwap - 2.0 * width
 
 
 def calculate_vwap_bands(bars: pd.DataFrame) -> pd.DataFrame:

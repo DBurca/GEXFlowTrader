@@ -1,5 +1,8 @@
 """
-Net Gamma Exposure (GEX) calculations, zone clustering, and Phase 2 model skeletons.
+Net gamma exposure for the SPY paper forward test.
+
+Macro strike GEX uses open interest. Intraday levels use a separate dollar-gamma
+book for the regime and zero-gamma line, and an open-interest book for walls.
 """
 
 from __future__ import annotations
@@ -11,18 +14,6 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
-
-import config
-
-
-@dataclass(frozen=True)
-class GEXZone:
-    """A clustered price band with aggregated net GEX."""
-
-    price_low: float
-    price_high: float
-    net_gex: float
-    regime: str  # "mean_reverting" | "momentum"
 
 
 def calculate_strike_gex(option_fields: pd.DataFrame, spot_price: float) -> pd.DataFrame:
@@ -59,174 +50,6 @@ def classify_regime(total_net_gex: float) -> str:
     if total_net_gex >= 0:
         return "mean_reverting"
     return "momentum"
-
-
-def cluster_gex_zones(
-    gex_profile: pd.DataFrame,
-    resolution: int | None = None,
-    spot_price: float | None = None,
-) -> list[GEXZone]:
-    """
-    Group strikes into price zones based on RESOLUTION.
-
-    Lower resolution (1) merges strikes into broad major-wall bands.
-    Higher resolution (10) preserves finer, more granular zones.
-    """
-    resolution = config.RESOLUTION if resolution is None else resolution
-    if not (1 <= resolution <= 10):
-        raise ValueError(f"resolution must be between 1 and 10 (got {resolution}).")
-
-    strikes = gex_profile["strikePrice"].to_numpy(dtype=float)
-    gex_values = gex_profile["net_gex"].to_numpy(dtype=float)
-
-    if len(strikes) == 0:
-        return []
-
-    spot = float(spot_price if spot_price is not None else strikes[len(strikes) // 2])
-    strike_span = float(strikes.max() - strikes.min()) or spot * 0.05
-    # Resolution 1 -> wide bands; resolution 10 -> narrow bands.
-    band_width = strike_span / max(resolution * 1.5, 1.0)
-
-    zones: list[GEXZone] = []
-    band_start_idx = 0
-
-    for idx in range(1, len(strikes)):
-        if strikes[idx] - strikes[band_start_idx] >= band_width:
-            zones.append(_build_zone(strikes, gex_values, band_start_idx, idx - 1))
-            band_start_idx = idx
-
-    zones.append(_build_zone(strikes, gex_values, band_start_idx, len(strikes) - 1))
-
-    max_abs_gex = max((abs(zone.net_gex) for zone in zones), default=0.0)
-    if max_abs_gex == 0:
-        return zones
-
-    # At low resolution, keep only the dominant walls.
-    keep_count = max(1, min(len(zones), resolution + 1))
-    if resolution <= 3:
-        zones = sorted(zones, key=lambda z: abs(z.net_gex), reverse=True)[:keep_count]
-        zones = sorted(zones, key=lambda z: z.price_low)
-
-    return zones
-
-
-def _build_zone(
-    strikes: np.ndarray,
-    gex_values: np.ndarray,
-    start_idx: int,
-    end_idx: int,
-) -> GEXZone:
-    net_gex = float(gex_values[start_idx : end_idx + 1].sum())
-    regime = "mean_reverting" if net_gex >= 0 else "momentum"
-    return GEXZone(
-        price_low=float(strikes[start_idx]),
-        price_high=float(strikes[end_idx]),
-        net_gex=net_gex,
-        regime=regime,
-    )
-
-
-def build_gex_summary(
-    option_fields: pd.DataFrame,
-    spot_price: float,
-    resolution: int | None = None,
-) -> dict[str, Any]:
-    """Run the full GEX pipeline and return profile, total, zones, and regime."""
-    profile = calculate_strike_gex(option_fields, spot_price)
-    total = calculate_total_net_gex(profile)
-    zones = cluster_gex_zones(profile, resolution=resolution, spot_price=spot_price)
-
-    return {
-        "profile": profile,
-        "total_net_gex": total,
-        "regime": classify_regime(total),
-        "zones": zones,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Phase 2 skeletons
-# ---------------------------------------------------------------------------
-
-
-def fit_hmm_regime(
-    total_gex_history: pd.Series,
-    n_states: int = 2,
-    random_state: int = 42,
-) -> dict[str, Any]:
-    """
-    Skeleton: Hidden Markov Model for regime classification from Total GEX history.
-
-    Uses hmmlearn.GaussianHMM to label latent momentum vs. mean-reverting states.
-    Wire this up once a historical Total GEX time series is available.
-    """
-    try:
-        from hmmlearn.hmm import GaussianHMM
-    except ImportError as exc:
-        raise ImportError(
-            "hmmlearn is required for HMM regime modeling. "
-            "Install with: pip install hmmlearn"
-        ) from exc
-
-    if total_gex_history.empty:
-        raise ValueError("total_gex_history must contain at least one observation.")
-
-    observations = total_gex_history.dropna().to_numpy(dtype=float).reshape(-1, 1)
-    if len(observations) < n_states:
-        raise ValueError(
-            f"Need at least {n_states} observations for {n_states}-state HMM."
-        )
-
-    model = GaussianHMM(
-        n_components=n_states,
-        covariance_type="full",
-        random_state=random_state,
-    )
-    model.fit(observations)
-    hidden_states = model.predict(observations)
-
-    return {
-        "model": model,
-        "hidden_states": hidden_states,
-        "n_states": n_states,
-        "status": "skeleton_implemented",
-    }
-
-
-def fit_ou_process(
-    series: pd.Series,
-    dt: float = 1.0,
-) -> dict[str, float]:
-    """
-    Skeleton: Ornstein-Uhlenbeck parameter estimation for mean reversion.
-
-        dX_t = theta * (mu - X_t) * dt + sigma * dW_t
-
-    Intended for use when Total GEX is highly positive (mean-reverting regime).
-    """
-    clean = series.dropna().astype(float)
-    if len(clean) < 3:
-        raise ValueError("Need at least 3 observations to estimate OU parameters.")
-
-    x = clean.to_numpy()
-    x_lag = x[:-1]
-    x_next = x[1:]
-
-    # AR(1) proxy: X_{t+1} = a + b * X_t  =>  theta = (1-b)/dt, mu = a/(1-b)
-    b, a = np.polyfit(x_lag, x_next, 1)
-    theta = max((1.0 - b) / dt, 1e-8)
-    mu = float(a / max(1.0 - b, 1e-8))
-
-    residuals = x_next - (a + b * x_lag)
-    sigma = float(np.std(residuals, ddof=1) / np.sqrt(dt))
-
-    return {
-        "theta": float(theta),
-        "mu": mu,
-        "sigma": sigma,
-        "dt": dt,
-        "status": "skeleton_implemented",
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +96,12 @@ class IntradayGEXSnapshot:
     spot: float
     call_wall: float | None
     put_wall: float | None
+    call_wall_2: float | None
+    put_wall_2: float | None
+    call_wall_1_gamma: float | None
+    call_wall_2_gamma: float | None
+    put_wall_1_gamma: float | None
+    put_wall_2_gamma: float | None
     zero_gamma: float | None
     net_gex: float
     call_gex: float
@@ -366,12 +195,179 @@ def strike_exposure_frame(
     return exposure.reset_index(drop=True)
 
 
+# Secondary wall is kept only when its dollar gamma is at least this
+# fraction of the primary strike's dollar gamma.
+WALL_SECONDARY_RATIO = 0.80
+
+
+def oi_dollar_gamma(gamma: Any, open_interest: Any, spot: float) -> np.ndarray:
+    """Dollar gamma = Gamma × open interest × 100 × spot."""
+    if not np.isfinite(spot) or spot <= 0:
+        raise ValueError(f"spot must be a positive finite price (got {spot}).")
+    return _finite(gamma) * _finite(open_interest) * 100.0 * float(spot)
+
+
+def net_gex(chain: pd.DataFrame, spot: float) -> float:
+    """Call dollar gamma minus put dollar gamma, summed across strikes."""
+    if chain.empty:
+        return 0.0
+    calls = oi_dollar_gamma(chain["call_gamma"], chain["call_openInterest"], spot)
+    puts = oi_dollar_gamma(chain["put_gamma"], chain["put_openInterest"], spot)
+    return float(np.sum(calls - puts))
+
+
+def rank_gamma_walls(
+    strikes: Any,
+    exposure: Any,
+    ratio: float = WALL_SECONDARY_RATIO,
+) -> tuple[float | None, float | None, float | None, float | None]:
+    """
+    Primary and secondary walls.
+
+    Returns (strike_1, dollar_gamma_1, strike_2, dollar_gamma_2). The
+    secondary strike is None when its dollar gamma is below ``ratio`` times
+    the primary.
+    """
+    strike_array = np.asarray(strikes, dtype=float)
+    values = np.asarray(exposure, dtype=float)
+    if strike_array.size == 0 or strike_array.size != values.size:
+        return None, None, None, None
+    finite = np.isfinite(values) & np.isfinite(strike_array) & (values > 0)
+    if not finite.any():
+        return None, None, None, None
+    order = np.argsort(np.where(finite, values, -np.inf))[::-1]
+    first = int(order[0])
+    primary_strike = float(strike_array[first])
+    primary_gamma = float(values[first])
+    if order.size < 2:
+        return primary_strike, primary_gamma, None, None
+    second = int(order[1])
+    if not finite[second] or values[second] < ratio * primary_gamma:
+        return primary_strike, primary_gamma, None, None
+    return primary_strike, primary_gamma, float(strike_array[second]), float(values[second])
+
+
 def call_wall_strike(exposure: pd.DataFrame) -> float | None:
     """Strike with the single highest positive call dollar gamma."""
     values = exposure["call_dollar_gamma"].to_numpy(dtype=float)
     if values.size == 0 or not np.isfinite(values).any() or np.nanmax(values) <= 0:
         return None
     return float(exposure["strikePrice"].iloc[int(np.nanargmax(values))])
+
+
+# A one-strike step on SPY is a real wall walk. Anything farther has to
+# repeat for three polls before it replaces the level. One bad gamma quote
+# otherwise becomes the wall for a single minute and then snaps back.
+LEVEL_JUMP = 1.01
+LEVEL_CONFIRM = 3
+
+
+@dataclass
+class LevelState:
+    """Last accepted level, plus a jump that is waiting to be confirmed."""
+
+    accepted: float | None = None
+    pending: float | None = None
+    count: int = 0
+    clearing: bool = False
+
+
+def stabilize_level(
+    candidate: float | None,
+    state: LevelState,
+    jump: float = LEVEL_JUMP,
+    confirm: int = LEVEL_CONFIRM,
+) -> LevelState:
+    """Accept a small move immediately. Hold a larger jump until it repeats."""
+    if candidate is None or not np.isfinite(candidate):
+        return state
+    value = float(candidate)
+    if state.accepted is None or abs(value - state.accepted) <= jump:
+        return LevelState(accepted=value)
+    if state.pending is not None and abs(value - state.pending) <= jump:
+        count = state.count + 1
+        pending = state.pending
+    else:
+        count = 1
+        pending = value
+    if count >= confirm:
+        return LevelState(accepted=pending)
+    return LevelState(accepted=state.accepted, pending=pending, count=count)
+
+
+def stabilize_optional_level(
+    candidate: float | None,
+    state: LevelState,
+    jump: float = LEVEL_JUMP,
+    confirm: int = LEVEL_CONFIRM,
+) -> LevelState:
+    """Like ``stabilize_level``, but a missing reading can clear the level.
+
+    A new strike and a disappearance both have to repeat for ``confirm``
+    polls. A one-strike step is taken immediately once a level exists.
+    """
+    value = None if candidate is None or not np.isfinite(candidate) else float(candidate)
+    if state.accepted is None:
+        if value is None:
+            return LevelState()
+        if state.pending is not None and abs(value - state.pending) <= jump:
+            count = state.count + 1
+            pending = state.pending
+        else:
+            count = 1
+            pending = value
+        if count >= confirm:
+            return LevelState(accepted=pending)
+        return LevelState(pending=pending, count=count)
+    if value is not None and abs(value - state.accepted) <= jump:
+        return LevelState(accepted=value)
+    if value is None:
+        count = state.count + 1 if state.clearing else 1
+        if count >= confirm:
+            return LevelState()
+        return LevelState(accepted=state.accepted, clearing=True, count=count)
+    if (
+        not state.clearing
+        and state.pending is not None
+        and abs(value - state.pending) <= jump
+    ):
+        count = state.count + 1
+        pending = state.pending
+    else:
+        count = 1
+        pending = value
+    if count >= confirm:
+        return LevelState(accepted=pending)
+    return LevelState(accepted=state.accepted, pending=pending, count=count)
+
+
+def stabilize_optional_series(
+    values: Any,
+    jump: float = LEVEL_JUMP,
+    confirm: int = LEVEL_CONFIRM,
+) -> list[float | None]:
+    """Causal filter for a secondary wall that is allowed to disappear."""
+    state = LevelState()
+    cleaned: list[float | None] = []
+    for value in values:
+        number = None if value is None else float(value)
+        state = stabilize_optional_level(number, state, jump, confirm)
+        cleaned.append(state.accepted)
+    return cleaned
+
+
+def stabilize_series(
+    values: Any,
+    jump: float = LEVEL_JUMP,
+    confirm: int = LEVEL_CONFIRM,
+) -> list[float | None]:
+    """Causal filter for a column of wall or zero-gamma readings."""
+    state = LevelState()
+    cleaned: list[float | None] = []
+    for value in values:
+        state = stabilize_level(None if value is None else float(value), state, jump, confirm)
+        cleaned.append(state.accepted)
+    return cleaned
 
 
 def put_wall_strike(exposure: pd.DataFrame) -> float | None:
@@ -473,11 +469,21 @@ def build_intraday_snapshot(
     """Reduce one 0DTE chain to walls, zero gamma, CDF, and ATM IV."""
     exposure = strike_exposure_frame(chain, spot, as_of)
     net = exposure["net_dollar_gamma"].to_numpy(dtype=float)
+    call_exposure = oi_dollar_gamma(chain["call_gamma"], chain["call_openInterest"], float(spot))
+    put_exposure = oi_dollar_gamma(chain["put_gamma"], chain["put_openInterest"], float(spot))
+    call_1, call_1_g, call_2, call_2_g = rank_gamma_walls(chain["strikePrice"], call_exposure)
+    put_1, put_1_g, put_2, put_2_g = rank_gamma_walls(chain["strikePrice"], put_exposure)
     return IntradayGEXSnapshot(
         as_of=_as_eastern(as_of),
         spot=float(spot),
-        call_wall=call_wall_strike(exposure),
-        put_wall=put_wall_strike(exposure),
+        call_wall=call_1,
+        put_wall=put_1,
+        call_wall_2=call_2,
+        put_wall_2=put_2,
+        call_wall_1_gamma=call_1_g,
+        call_wall_2_gamma=call_2_g,
+        put_wall_1_gamma=put_1_g,
+        put_wall_2_gamma=put_2_g,
         zero_gamma=zero_gamma_level(exposure["strikePrice"], net, spot=float(spot)),
         net_gex=float(np.nansum(net)),
         call_gex=float(np.nansum(exposure["call_dollar_gamma"])),

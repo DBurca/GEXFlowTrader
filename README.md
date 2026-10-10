@@ -1,0 +1,305 @@
+# MacroGEX
+
+Paper forward test of three SPY options strategies, with a read-only session chart. The tester polls Schwab, writes a DuckDB journal, and publishes a JSON snapshot. A second process draws that snapshot. No broker orders are sent.
+
+The live chart is [http://129.146.241.140:8080/](http://129.146.241.140:8080/).
+
+## System
+
+Two containers share one data volume. The tester is the only process that talks to Schwab and the only process that opens the database. The dashboard opens the JSON file the tester rewrites after each commit.
+
+```mermaid
+flowchart LR
+  subgraph schwab [Schwab Market Data]
+    quotes[Quotes and chains]
+    history[1-minute bars]
+  end
+
+  subgraph host [Oracle VM]
+    subgraph tester [spy-forward]
+      poll[60-second poll]
+      signals[Signal and paper fill]
+      db[(DuckDB)]
+      json[live_view.json]
+    end
+    subgraph dash [spy-dashboard]
+      http[HTTP :8080]
+      page[Lightweight Charts]
+    end
+  end
+
+  discord[Discord webhook]
+
+  quotes --> poll
+  history --> poll
+  poll --> signals
+  signals --> db
+  db --> json
+  json --> http
+  http --> page
+  signals --> discord
+```
+
+A poll is one transaction. If the chain, the bars, or the write fails, that minute is discarded: no snapshot row, no paper fill, no balance change. The process then waits 15 seconds and doubles the wait up to 5 minutes. Auth failures also ping Discord with `@everyone`.
+
+```mermaid
+sequenceDiagram
+  participant Clock
+  participant Tester
+  participant Schwab
+  participant DuckDB
+  participant JSON as live_view.json
+  participant Chart
+
+  Clock->>Tester: session open
+  loop every 60 seconds
+    Tester->>Schwab: spot, 1-minute bars, 0DTE chain, 0-1 DTE GEX
+    Tester->>Schwab: 30-90 DTE book, every 15 minutes
+    Tester->>Tester: levels, bands, signals, paper marks
+    Tester->>DuckDB: commit snapshot, trades, balances
+    Tester->>JSON: atomic replace
+  end
+  Chart->>JSON: GET /api/session every 15 seconds
+```
+
+When the NYSE is closed the tester sleeps until the next 09:30 ET open and logs that time. CPI, NFP, and FOMC windows suppress new entries. The calendar covers the 2026 and 2027 NYSE holidays and early closes.
+
+## What each process owns
+
+| Process | Reads | Writes | Never does |
+| --- | --- | --- | --- |
+| `live_forward.py` | Schwab, `.env`, the token file | DuckDB, `live_view.json`, Discord | Send a broker order |
+| `live_dashboard.py` | `live_view.json` | The HTTP response | Open DuckDB, call Schwab, hold a token |
+
+DuckDB allows one writer. A second connection to the live file fails, which is why the chart is a file reader.
+
+## Market data
+
+| Book | When | What it feeds |
+| --- | --- | --- |
+| Spot and 1-minute bars | Every poll | VWAP, 5-minute bars, HMM, OU |
+| 0DTE chain, 30 strikes | Every poll | Walls, zero gamma, CDF, ATM IV, intraday structures |
+| 0DTE and 1DTE chain | Every poll | `gex_0_1` magnitude |
+| 30–90 DTE chain, 50 strikes | Every 15 minutes, or every poll while a macro position is open | Macro GEX, gamma flip, the macro put spread |
+
+Schwab implied vol arrives as a percent and is stored as a decimal. Volume on the chain is already the session total, so CDF is not a cumulative sum of snapshots.
+
+The access token is minted again when it is older than 28 minutes, and only while the tester is polling. Schwab’s refresh token lasts 7 days from the browser login that created it. Saving the rotated string in `SCHWAB_REFRESH_TOKEN_PATH` (`/data/schwab_refresh_token`, mode `600`) keeps the current string, and it does not start a new 7-day window. On expiry Schwab rejects the token request. The tester posts `@everyone` to Discord, backs off, and leaves the chart on the last good session. `get_refresh_token.py` is the browser login that mints the next refresh token. One app key has one live refresh token. A second client that refreshes the same token invalidates the server.
+
+## Measures
+
+Two gamma books are kept on purpose. The regime sign uses the intraday dollar-gamma book. Wall strikes and the GEX magnitudes use open interest.
+
+**Intraday dollar gamma** (regime, zero gamma), through 10:30 ET weighted by open interest, and after that by `0.4 × OI + 0.6 × volume`:
+
+```text
+Dollar Gamma = Gamma × weight × 100 × Spot² × 0.01
+```
+
+Put dollar gamma is signed negative. Net intraday GEX is the sum. Zero gamma is the interpolated cumulative-zero closest to spot.
+
+**Wall rank and GEX magnitude:**
+
+```text
+Dollar Gamma = Gamma × Open Interest × 100 × Spot
+```
+
+| Series | Definition |
+| --- | --- |
+| Call wall 1 / put wall 1 | Strike with the largest dollar gamma on that side |
+| Call wall 2 / put wall 2 | Next strike, kept only when its dollar gamma is at least 80% of the primary. Otherwise null |
+| 0–1 DTE GEX | Signed sum of that formula over expirations with 0 or 1 day to expiry |
+| 30–90 DTE GEX | `(call OI × call gamma − put OI × put gamma) × 100 × spot`, summed |
+| Total net GEX | 0–1 DTE GEX + 30–90 DTE GEX |
+
+A wall or zero-gamma print that jumps more than one SPY strike ($1.01) is held until the new level repeats for three polls. A one-strike step is accepted immediately. A secondary wall has to confirm for three polls before it appears, and it clears only after three polls of absence.
+
+**Expected move**, centered on VWAP:
+
+```text
+width = Spot × ATM IV × sqrt(1/252)
+1σ    = VWAP ± width
+2σ    = VWAP ± 2 × width
+```
+
+ATM IV is the average of the call and put implied vol at the strike nearest spot.
+
+**CDF** is share-delta flow on the 0DTE book:
+
+```text
+CDF = Σ(call volume × call delta) − Σ(put volume × |put delta|)
+```
+
+**HMM** is a two-state Gaussian model on 1-minute returns, refit at most every 30 minutes. State 0 is the lower-variance state.
+
+**OU theta** is the AR(1) mean-reversion speed on those closes. Theta at or below `0.005` counts as faded mean reversion for the macro swing.
+
+## Strategies
+
+Each strategy has its own cash account, one open position, and a 5-minute cooldown after a stop. Intraday entries fire on a completed 5-minute bar. New 0DTE entries stop 15 minutes before the close. Open 0DTE positions flatten in the last 5 minutes.
+
+```mermaid
+flowchart TD
+  bar["Completed 5-minute bar"]
+  bar --> guards{"Blackout, charm pin, or last 15 minutes?"}
+  guards -->|yes| skip["No new entry"]
+  guards -->|no| regime{"Intraday net GEX"}
+
+  regime -->|"positive, macro GEX at least 0, HMM state 0"| absorb["Absorption"]
+  regime -->|"negative, and macro GEX below 0 or spot under the flip"| cascade["Cascade"]
+
+  absorb --> fade{"Failed test of a wall or sigma band, IV stable, CDF agrees"}
+  fade -->|yes| credit["0DTE credit spread"]
+  fade -->|no| skip
+
+  cascade --> brk{"Close through the active wall, IV spike, CDF accelerating"}
+  brk -->|yes| debit["0DTE debit spread"]
+  brk -->|no| skip
+
+  settle["Last 5 minutes of the session"] --> macro{"Spot under the macro flip, book transitioning, HMM 0 to 1 or OU faded"}
+  macro -->|yes| swing["30 to 60 DTE put debit"]
+```
+
+| | Absorption | Cascade | Macro swing |
+| --- | --- | --- | --- |
+| Regime | Intraday GEX > 0, macro GEX ≥ 0, HMM state 0 | Intraday GEX < 0, and macro GEX < 0 or spot below the flip | Spot below the macro flip, and the book is negative or the prior close was above the flip |
+| Extra | ATM IV within 0.002 of the 15-minute reading. CDF moves with the fade, or is flat | IV up 0.005 or 3% versus 15 minutes ago. 15-minute CDF change larger than the prior 15 minutes, and in the trade direction | HMM shifted 0 → 1, or OU theta ≤ 0.005. Checked once in the closing 5 minutes |
+| Trigger | 5-minute test of the put wall, call wall, 1σ, or 2σ that fails to close through. A wall wins when both a wall and a band qualify | 5-minute close through `call_wall_2` on the upside, or `put_wall_2` on the downside, when that secondary wall exists. Otherwise the primary wall or zero gamma. Price must be on the correct side of VWAP | Same-day check during the closing 5 minutes |
+| Structure | 0DTE credit, short strike at the tested level, long strike one strike further out | 0DTE debit, about $2 wide, long strike nearest spot | 30–60 DTE put debit, about $5 wide, expiration nearest 45 DTE |
+| Stop | Close back through the tested level, with CDF confirming. A 1σ fade uses the secondary wall as that level when the secondary exists | Close back through zero gamma | Next session: HMM back in state 0. Or, in the closing 5 minutes, spot back above the flip or macro GEX ≥ 0 |
+| Take profit | Half the credit, or spot back to VWAP or zero gamma | Spot reaches the 2σ band in the trade direction, or CDF flattens | The exit rules above |
+| Flatten | Last 5 minutes | Last 5 minutes | Held overnight |
+
+A quote is skipped when the combined bid-ask width is more than `SPREAD_BA_MAX_RATIO` (default 5%) of the structure's mid value, when the premium is under $0.05, or when the credit or debit is wider than the strikes. The charm guard blocks new entries in the last hour when spot is within 0.15% of the 0DTE strike with the most open interest.
+
+## Paper account
+
+| Rule | Value |
+| --- | --- |
+| Starting balance | `INITIAL_BALANCE` per strategy, default $100,000. Cumulative is the sum |
+| Risk | 2% of that strategy's balance |
+| Size | Whole contracts, max loss inside the risk budget, cap 25 |
+| Fees | $0.65 × contracts × legs × 2 |
+| Mark | Mid of each leg. A stop or flatten may fall back to intrinsic when quotes are missing |
+| PnL | `(entry net − current net) × 100 × contracts − fees`. Net is short mid minus long mid, so a credit is positive |
+
+## Storage
+
+`DUCKDB_PATH` defaults to `forward_test.db`. Compose mounts `./data` at `/data`.
+
+```mermaid
+erDiagram
+  SNAPSHOTS {
+    string ts
+    float spot
+    float intrad_net_gex
+    float call_wall
+    float put_wall
+    float call_wall_2_strike
+    float put_wall_2_strike
+    float zero_gamma
+    float gex_0_1
+    float total_net_gex
+    float macro_net_gex
+    float vwap
+    float upper_1
+    float lower_1
+  }
+  TRADES {
+    string ts
+    string strategy
+    string event
+    float pnl
+    string detail
+  }
+  BALANCES {
+    string strategy PK
+    float balance
+  }
+  OPEN_POSITIONS {
+    string strategy PK
+    string payload
+  }
+  SESSION_STATE {
+    string key PK
+    string value
+  }
+```
+
+`live_view.json` is replaced atomically beside the database. It holds the latest session only: price levels, CDF, ATM IV, the three GEX series, balances, open positions, and trades. A gap longer than three minutes is a break in the line. The publisher recomputes the expected-move bands from stored spot, VWAP, and ATM IV, and it replays the wall filter, so a chart rebuilt from an older file still uses the current level rules.
+
+## Chart
+
+[http://129.146.241.140:8080/](http://129.146.241.140:8080/) polls `/api/session` every 15 seconds. `/health` returns `ok`.
+
+| Series | Drawing |
+| --- | --- |
+| Spot | Solid white |
+| VWAP | Solid gray |
+| 1σ | Dotted blue, expected move around VWAP |
+| 2σ | Dashed blue |
+| Call wall 1 | Solid red |
+| Call wall 2 | Dashed red, omitted when null |
+| Put wall 1 | Solid green |
+| Put wall 2 | Dashed green, omitted when null |
+| Zero gamma | Solid gold |
+| Net GEX | Total, 0–1 DTE, and 30–90 DTE |
+| PnL | Change from each balance at the session open |
+
+Clock labels are America/New_York. The price scale follows spot and the 2σ bands so a wall outside that range does not flatten the session.
+
+## Layout
+
+| Module | Responsibility |
+| --- | --- |
+| `live_forward.py` | Session loop, persistence, Discord, paper positions |
+| `live_market.py` | Schwab session, chains, bars, token rotation |
+| `live_signals.py` | Entry rules, structures, HMM, OU, slippage, fees |
+| `live_view.py` | JSON publisher |
+| `live_dashboard.py` | Read-only chart server |
+| `gex_engine.py` | Strike GEX, dollar gamma, walls, CDF, ATM IV, level filter |
+| `ta_engine.py` | VWAP and expected-move bands |
+| `signal_engine.py` | Macro gamma flip |
+| `event_calendar.py` | NYSE hours, holidays, CPI / NFP / FOMC blackouts |
+| `test_forward_logic.py` | Logic checks, no network |
+| `docker-compose.yml` | Tester and dashboard |
+| `Dockerfile` | `python:3.11-slim` image used by both services |
+
+## Run
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python3 test_forward_logic.py
+```
+
+Copy `.env.example` to `.env` on the host that will poll Schwab. Do not commit `.env`, the database, or the token file.
+
+```text
+SCHWAB_APP_KEY
+SCHWAB_APP_SECRET
+SCHWAB_REFRESH_TOKEN
+SCHWAB_REFRESH_TOKEN_PATH=/data/schwab_refresh_token
+DISCORD_WEBHOOK_URL
+DUCKDB_PATH=/data/forward_test.db
+SPREAD_BA_MAX_RATIO=0.05
+INITIAL_BALANCE=100000
+```
+
+The current deployment is `/home/ubuntu/spy-forward` on the Oracle VM. Compose builds one image and starts both processes. The dashboard publishes port 8080. The tester has no published ports.
+
+```bash
+docker compose up -d --build
+```
+
+A restart sends a Discord message that the forward test started. While the market is closed the process waits for the next open.
+
+## Operate
+
+- Watch the session at [http://129.146.241.140:8080/](http://129.146.241.140:8080/). The page is enough. There is no local chart process.
+- Keep a single Schwab session. Refreshing the same app key anywhere else rotates the token out from under the tester.
+- About 7 days after the last browser login, run `python3 get_refresh_token.py` on your machine (it listens on `https://127.0.0.1:8080`, which is not the server chart). Stop `spy-forward`, write the new `SCHWAB_REFRESH_TOKEN` into `.env` and into `/data/schwab_refresh_token`, then start it again. The file wins over `.env`. Leaving the tester running during that swap can overwrite the new token with a refresh of the old one.
+- The dashboard container mounts `./data` read-only and has no `.env`.
+- Logs: `docker logs spy-forward` and `docker logs spy-dashboard`.
+- A failed poll is visible in Discord and in the tester log. The chart simply shows a gap.

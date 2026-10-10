@@ -280,6 +280,14 @@ def _snapshot() -> "MarketSnapshot":
         intrad_gex=1,
         call_wall=510,
         put_wall=490,
+        call_wall_2=None,
+        put_wall_2=None,
+        call_wall_1_gamma=None,
+        call_wall_2_gamma=None,
+        put_wall_1_gamma=None,
+        put_wall_2_gamma=None,
+        gex_0_1=1.0,
+        total_net_gex=2.0,
         zero_gamma=500,
         cdf=10,
         atm_iv=0.15,
@@ -445,6 +453,121 @@ def _five(rows: list[tuple[str, float, float, float, float]]) -> pd.DataFrame:
     )
 
 
+def test_walls_expected_move_and_secondary_rules() -> None:
+    from gex_engine import net_gex, rank_gamma_walls
+    from ta_engine import expected_move
+
+    strikes = [100, 101, 102]
+    exposure = [10, 9, 5]
+    primary, primary_g, secondary, secondary_g = rank_gamma_walls(strikes, exposure)
+    assert primary == 100 and primary_g == 10
+    assert secondary == 101 and secondary_g == 9
+    assert rank_gamma_walls(strikes, [10, 7, 1])[2] is None
+
+    chain = pd.DataFrame({
+        "call_gamma": [0.02, 0.01],
+        "call_openInterest": [100, 50],
+        "put_gamma": [0.01, 0.02],
+        "put_openInterest": [40, 80],
+    })
+    # (0.02*100 - 0.01*40) + (0.01*50 - 0.02*80) = (2 - 0.4) + (0.5 - 1.6) = 0.5
+    # times 100 * spot 500 = 25000
+    assert net_gex(chain, 500) == 25000
+
+    move = expected_move(500, 0.16)
+    assert abs(move - 500 * 0.16 * (1 / 252) ** 0.5) < 1e-9
+
+    bar = _bar(100, 101, 98, 99.5)
+    faded = absorption_signal(
+        bar,
+        intrad_gex=1,
+        macro_gex=1,
+        hmm_state=0,
+        call_wall=110,
+        put_wall=100,
+        upper_2=120,
+        lower_2=80,
+        upper_1=105,
+        lower_1=99,
+        call_wall_2=112,
+        put_wall_2=97,
+        cdf_now=5,
+        cdf_prev=4,
+        iv_now=0.1,
+        iv_prev=0.1,
+    )
+    assert faded is not None and faded.stop == 97
+
+    previous = _bar(100, 101, 99, 100)
+    through_primary = _bar(100, 106, 100, 105)
+    through_secondary = _bar(100, 113, 100, 112.5)
+    blocked = cascade_signal(
+        previous,
+        through_primary,
+        intrad_gex=-1,
+        macro_gex=-1,
+        gamma_flip=90,
+        spot=105,
+        call_wall=104,
+        put_wall=90,
+        zero_gamma=101,
+        call_wall_2=112,
+        vwap=100,
+        cdf_now=20,
+        cdf_15=10,
+        cdf_30=5,
+        iv_now=0.2,
+        iv_prev=0.1,
+    )
+    assert blocked is None
+    confirmed = cascade_signal(
+        previous,
+        through_secondary,
+        intrad_gex=-1,
+        macro_gex=-1,
+        gamma_flip=90,
+        spot=112.5,
+        call_wall=104,
+        put_wall=90,
+        zero_gamma=101,
+        call_wall_2=112,
+        vwap=100,
+        cdf_now=20,
+        cdf_15=10,
+        cdf_30=5,
+        iv_now=0.2,
+        iv_prev=0.1,
+    )
+    assert confirmed is not None and confirmed.anchor == 112
+
+
+def test_level_spikes_are_held() -> None:
+    from gex_engine import LevelState, stabilize_level, stabilize_series
+
+    state = LevelState()
+    for reading in (777, 777, 784, 777):
+        state = stabilize_level(reading, state)
+    assert state.accepted == 777
+
+    state = LevelState()
+    for reading in (778, 775, 775, 778):
+        state = stabilize_level(reading, state)
+    assert state.accepted == 778
+
+    state = LevelState()
+    for reading in (780, 777, 777, 777):
+        state = stabilize_level(reading, state)
+    assert state.accepted == 777
+
+    state = LevelState()
+    for reading in (777, 778):
+        state = stabilize_level(reading, state)
+    assert state.accepted == 778
+
+    cleaned = stabilize_series([777.25, 772.12, 777.25, 772.05, 777.31])
+    assert cleaned == [777.25, 777.25, 777.25, 777.25, 777.31]
+
+
 if __name__ == "__main__":
     test_calendar()
     test_absorption_and_cascade()
@@ -454,4 +577,6 @@ if __name__ == "__main__":
     test_ou_and_persistence()
     test_chain_parser_and_session_bars()
     test_paper_absorption_roundtrip()
+    test_level_spikes_are_held()
+    test_walls_expected_move_and_secondary_rules()
     print("forward logic checks passed")

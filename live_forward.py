@@ -31,8 +31,24 @@ from event_calendar import (
     now_eastern,
     session_close_time,
 )
-from gex_engine import build_intraday_snapshot, calculate_strike_gex, calculate_total_net_gex, classify_regime
-from live_market import AuthError, MacroBook, SchwabSession, fetch_intraday_chain, fetch_macro_book, session_bars
+from gex_engine import (
+    LevelState,
+    build_intraday_snapshot,
+    calculate_strike_gex,
+    calculate_total_net_gex,
+    classify_regime,
+    stabilize_level,
+    stabilize_optional_level,
+)
+from live_market import (
+    AuthError,
+    MacroBook,
+    SchwabSession,
+    fetch_intraday_chain,
+    fetch_macro_book,
+    fetch_near_term_gex,
+    session_bars,
+)
 from live_signals import (
     EntrySignal,
     Leg,
@@ -60,8 +76,9 @@ from live_signals import (
     five_minute_bars,
     value_at_or_before,
 )
+from live_view import publish_live_view
 from signal_engine import calculate_gamma_flip
-from ta_engine import calculate_vwap_bands
+from ta_engine import calculate_vwap_bands, expected_move_bands
 
 logging.basicConfig(
     level=logging.INFO,
@@ -90,6 +107,14 @@ class MarketSnapshot:
     intrad_gex: float
     call_wall: float | None
     put_wall: float | None
+    call_wall_2: float | None
+    put_wall_2: float | None
+    call_wall_1_gamma: float | None
+    call_wall_2_gamma: float | None
+    put_wall_1_gamma: float | None
+    put_wall_2_gamma: float | None
+    gex_0_1: float | None
+    total_net_gex: float | None
     zero_gamma: float | None
     cdf: float | None
     atm_iv: float | None
@@ -154,6 +179,12 @@ class ForwardTester:
         self.macro_checked_day: str | None = None
         self.last_signal_bar: str | None = None
         self.backoff = 15
+        self._level_day = None
+        self._call_wall_state = LevelState()
+        self._put_wall_state = LevelState()
+        self._call_wall_2_state = LevelState()
+        self._put_wall_2_state = LevelState()
+        self._zero_gamma_state = LevelState()
         self._setup_database()
         self._load_state()
 
@@ -188,6 +219,19 @@ class ForwardTester:
             )
             """
         )
+        for name, kind in (
+            ("call_wall_1_strike", "DOUBLE"),
+            ("call_wall_1_gamma", "DOUBLE"),
+            ("call_wall_2_strike", "DOUBLE"),
+            ("call_wall_2_gamma", "DOUBLE"),
+            ("put_wall_1_strike", "DOUBLE"),
+            ("put_wall_1_gamma", "DOUBLE"),
+            ("put_wall_2_strike", "DOUBLE"),
+            ("put_wall_2_gamma", "DOUBLE"),
+            ("gex_0_1", "DOUBLE"),
+            ("total_net_gex", "DOUBLE"),
+        ):
+            self.db.execute(f"ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS {name} {kind}")
         self.db.execute(
             """
             CREATE TABLE IF NOT EXISTS trades (
@@ -271,6 +315,7 @@ class ForwardTester:
                 self.iv_history.append((moment, float(iv)))
 
     def run(self) -> None:
+        self._publish_view()
         self._discord_text(
             "SPY forward test started. Paper only. "
             + ", ".join(f"{name} ${self.balances[name]:,.2f}" for name in (*STRATEGIES, "cumulative"))
@@ -302,6 +347,7 @@ class ForwardTester:
             self._restore(checkpoint)
             raise
         self._remember_flow(snap)
+        self._publish_view()
         logging.info(
             "STATE | spot=%.2f | iGEX=%s | mGEX=%s | HMM=%s | OU=%s | blackout=%s | charm=%s",
             snap.spot,
@@ -315,6 +361,64 @@ class ForwardTester:
         for event in events:
             self._discord_event(snap, event)
 
+    def _stable_levels(
+        self,
+        now: datetime,
+        call_wall: float | None,
+        put_wall: float | None,
+        zero_gamma: float | None,
+        call_wall_2: float | None,
+        put_wall_2: float | None,
+    ) -> tuple[float | None, float | None, float | None, float | None, float | None]:
+        """Drop a multi-strike jump that does not survive three polls."""
+        if self._level_day != now.date():
+            self._level_day = now.date()
+            self._call_wall_state = LevelState()
+            self._put_wall_state = LevelState()
+            self._call_wall_2_state = LevelState()
+            self._put_wall_2_state = LevelState()
+            self._zero_gamma_state = LevelState()
+        self._call_wall_state = self._hold_level("call wall", call_wall, self._call_wall_state)
+        self._put_wall_state = self._hold_level("put wall", put_wall, self._put_wall_state)
+        self._call_wall_2_state = self._hold_optional("secondary call wall", call_wall_2, self._call_wall_2_state)
+        self._put_wall_2_state = self._hold_optional("secondary put wall", put_wall_2, self._put_wall_2_state)
+        self._zero_gamma_state = self._hold_level("zero gamma", zero_gamma, self._zero_gamma_state)
+        return (
+            self._call_wall_state.accepted,
+            self._put_wall_state.accepted,
+            self._zero_gamma_state.accepted,
+            self._call_wall_2_state.accepted,
+            self._put_wall_2_state.accepted,
+        )
+
+    def _hold_level(self, name: str, candidate: float | None, state: LevelState) -> LevelState:
+        updated = stabilize_level(candidate, state)
+        if (
+            candidate is not None
+            and updated.accepted is not None
+            and abs(float(candidate) - updated.accepted) > 1.01
+        ):
+            logging.info(
+                "Unstable %s %.2f held at %.2f",
+                name,
+                float(candidate),
+                updated.accepted,
+            )
+        return updated
+
+    def _hold_optional(self, name: str, candidate: float | None, state: LevelState) -> LevelState:
+        updated = stabilize_optional_level(candidate, state)
+        if candidate is not None and updated.accepted != candidate and (
+            updated.accepted is None or abs(float(candidate) - updated.accepted) > 1.01
+        ):
+            logging.info(
+                "Unstable %s %.2f held at %s",
+                name,
+                float(candidate),
+                "none" if updated.accepted is None else f"{updated.accepted:.2f}",
+            )
+        return updated
+
     def _collect(self) -> MarketSnapshot:
         now = now_eastern()
         spot = self.client.spot(SYMBOL)
@@ -324,6 +428,18 @@ class ForwardTester:
         latest = bands.iloc[-1]
         chain = fetch_intraday_chain(self.client, SYMBOL, now.date())
         intrad = build_intraday_snapshot(chain, spot, now)
+        gex_0_1 = fetch_near_term_gex(self.client, SYMBOL, now.date(), spot)
+        call_wall, put_wall, zero_gamma, call_wall_2, put_wall_2 = self._stable_levels(
+            now,
+            intrad.call_wall,
+            intrad.put_wall,
+            intrad.zero_gamma,
+            intrad.call_wall_2,
+            intrad.put_wall_2,
+        )
+        upper_1, lower_1, upper_2, lower_2 = expected_move_bands(
+            float(latest["vwap"]), spot, float(intrad.atm_iv)
+        )
         book = self._macro_book(now)
         profile = calculate_strike_gex(book.gex_fields, spot)
         macro_gex = calculate_total_net_gex(profile)
@@ -339,16 +455,24 @@ class ForwardTester:
             now=now,
             spot=spot,
             intrad_gex=float(intrad.net_gex),
-            call_wall=intrad.call_wall,
-            put_wall=intrad.put_wall,
-            zero_gamma=intrad.zero_gamma,
+            call_wall=call_wall,
+            put_wall=put_wall,
+            call_wall_2=call_wall_2,
+            put_wall_2=put_wall_2,
+            call_wall_1_gamma=_finite(intrad.call_wall_1_gamma),
+            call_wall_2_gamma=_finite(intrad.call_wall_2_gamma) if call_wall_2 is not None else None,
+            put_wall_1_gamma=_finite(intrad.put_wall_1_gamma),
+            put_wall_2_gamma=_finite(intrad.put_wall_2_gamma) if put_wall_2 is not None else None,
+            gex_0_1=gex_0_1,
+            total_net_gex=gex_0_1 + float(macro_gex),
+            zero_gamma=zero_gamma,
             cdf=_finite(intrad.cdf),
             atm_iv=_finite(intrad.atm_iv),
             vwap=float(latest["vwap"]),
-            upper_1=float(latest["upper_1"]),
-            lower_1=float(latest["lower_1"]),
-            upper_2=float(latest["upper_2"]),
-            lower_2=float(latest["lower_2"]),
+            upper_1=upper_1,
+            lower_1=lower_1,
+            upper_2=upper_2,
+            lower_2=lower_2,
             macro_gex=float(macro_gex),
             gamma_flip=gamma_flip,
             macro_regime=classify_regime(macro_gex),
@@ -461,7 +585,7 @@ class ForwardTester:
         return breach_confirmed(
             position["direction"],
             float(bar["Close"]),
-            float(position["anchor"]),
+            float(position.get("stop") or position["anchor"]),
             snap.cdf,
             previous,
         )
@@ -576,6 +700,10 @@ class ForwardTester:
             put_wall=snap.put_wall,
             upper_2=snap.upper_2,
             lower_2=snap.lower_2,
+            upper_1=snap.upper_1,
+            lower_1=snap.lower_1,
+            call_wall_2=snap.call_wall_2,
+            put_wall_2=snap.put_wall_2,
             cdf_now=snap.cdf,
             cdf_prev=value_at_or_before(self.cdf_history, snap.now - timedelta(minutes=15)),
             iv_now=snap.atm_iv,
@@ -603,6 +731,8 @@ class ForwardTester:
             call_wall=snap.call_wall,
             put_wall=snap.put_wall,
             zero_gamma=snap.zero_gamma,
+            call_wall_2=snap.call_wall_2,
+            put_wall_2=snap.put_wall_2,
             vwap=snap.vwap,
             cdf_now=snap.cdf,
             cdf_15=value_at_or_before(self.cdf_history, snap.now - timedelta(minutes=15)),
@@ -670,6 +800,7 @@ class ForwardTester:
             "entry_day": snap.now.date().isoformat(),
             "entry_bar": bar_key,
             "anchor": signal.anchor,
+            "stop": signal.stop if signal.stop is not None else signal.anchor,
             "reason": signal.reason,
             "expiration": snap.macro_expiration if signal.strategy == "macro" else snap.now.date().isoformat(),
         }
@@ -788,8 +919,19 @@ class ForwardTester:
         metrics = _metrics_json(snap)
         self.db.execute("BEGIN TRANSACTION")
         try:
+            columns = [
+                "ts", "spot", "intrad_net_gex", "call_wall", "put_wall", "zero_gamma",
+                "cdf", "atm_iv", "vwap", "upper_1", "lower_1", "upper_2", "lower_2",
+                "macro_net_gex", "macro_gamma_flip", "macro_regime", "hmm_state",
+                "ou_theta", "ou_mu", "ou_sigma", "pin_strike", "blackout",
+                "charm_guard", "entry_block_reason",
+                "call_wall_1_strike", "call_wall_1_gamma", "call_wall_2_strike", "call_wall_2_gamma",
+                "put_wall_1_strike", "put_wall_1_gamma", "put_wall_2_strike", "put_wall_2_gamma",
+                "gex_0_1", "total_net_gex",
+            ]
             self.db.execute(
-                "INSERT INTO snapshots VALUES (" + ",".join(["?"] * 24) + ")",
+                "INSERT INTO snapshots (" + ", ".join(columns) + ") VALUES ("
+                + ",".join(["?"] * len(columns)) + ")",
                 [
                     snap.now.isoformat(),
                     snap.spot,
@@ -815,6 +957,16 @@ class ForwardTester:
                     snap.blackout,
                     snap.charm,
                     snap.entry_block,
+                    _db_float(snap.call_wall),
+                    _db_float(snap.call_wall_1_gamma),
+                    _db_float(snap.call_wall_2),
+                    _db_float(snap.call_wall_2_gamma),
+                    _db_float(snap.put_wall),
+                    _db_float(snap.put_wall_1_gamma),
+                    _db_float(snap.put_wall_2),
+                    _db_float(snap.put_wall_2_gamma),
+                    _db_float(snap.gex_0_1),
+                    _db_float(snap.total_net_gex),
                 ],
             )
             for event in events:
@@ -865,6 +1017,12 @@ class ForwardTester:
         except Exception:
             self.db.execute("ROLLBACK")
             raise
+
+    def _publish_view(self) -> None:
+        try:
+            publish_live_view(self.db)
+        except Exception:
+            logging.exception("Live view publish failed")
 
     def _remember_flow(self, snap: MarketSnapshot) -> None:
         if snap.cdf is not None:
@@ -1032,6 +1190,7 @@ def _position_to_json(position: dict[str, Any]) -> str:
         "entry_day": position["entry_day"],
         "entry_bar": position["entry_bar"],
         "anchor": position["anchor"],
+        "stop": position.get("stop", position["anchor"]),
         "reason": position["reason"],
         "expiration": position.get("expiration") or "",
     }
@@ -1043,6 +1202,7 @@ def _position_from_json(payload: str) -> dict[str, Any]:
     raw["legs"] = [Leg(**leg) for leg in raw["legs"]]
     raw["entry_time"] = datetime.fromisoformat(raw["entry_time"])
     raw["contracts"] = int(raw["contracts"])
+    raw["stop"] = raw.get("stop", raw["anchor"])
     return raw
 
 
@@ -1053,6 +1213,10 @@ def _metrics_json(snap: MarketSnapshot) -> str:
             "intrad_net_gex": snap.intrad_gex,
             "call_wall": snap.call_wall,
             "put_wall": snap.put_wall,
+            "call_wall_2": snap.call_wall_2,
+            "put_wall_2": snap.put_wall_2,
+            "gex_0_1": snap.gex_0_1,
+            "total_net_gex": snap.total_net_gex,
             "zero_gamma": snap.zero_gamma,
             "cdf": snap.cdf,
             "atm_iv": snap.atm_iv,

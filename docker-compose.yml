@@ -1,0 +1,27 @@
+services:
+  spy-forward:
+    build: .
+    image: spy-forward:latest
+    container_name: spy-forward
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      SCHWAB_REFRESH_TOKEN_PATH: /data/schwab_refresh_token
+    volumes:
+      - ./data:/data
+
+  spy-dashboard:
+    image: spy-forward:latest
+    container_name: spy-dashboard
+    restart: unless-stopped
+    depends_on:
+      - spy-forward
+    command: ["python", "-u", "live_dashboard.py"]
+    environment:
+      LIVE_VIEW_PATH: /data/live_view.json
+      DASHBOARD_PORT: "8080"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data:ro
