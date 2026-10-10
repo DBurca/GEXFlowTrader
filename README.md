@@ -1,4 +1,4 @@
-# MacroGEX
+# GEXFlowTrader
 
 Paper forward test of three SPY options strategies, with a read-only session chart. The tester polls Schwab, writes a DuckDB journal, and publishes a JSON snapshot. A second process draws that snapshot. No broker orders are sent.
 
