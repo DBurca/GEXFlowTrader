@@ -31,8 +31,17 @@ PAGE = """<!DOCTYPE html>
   .stat span { color: #8ea0b0; font-size: 12px; }
   .chart { height: 640px; margin-top: 4px; }
   .chart.short { height: 200px; }
+  .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .panel-head h2 { margin-bottom: 0; }
+  #fullscreen { background: #181e25; color: #d7e0e8; border: 1px solid #2a3440; border-radius: 6px; padding: 6px 10px; cursor: pointer; font: inherit; }
+  #price-panel.fullscreen { position: fixed; inset: 0; z-index: 40; background: #101418; margin: 0; padding: 12px 16px 16px; display: flex; flex-direction: column; }
+  #price-panel.fullscreen .chart { flex: 1 1 auto; height: auto; min-height: 0; }
   .legend { color: #8ea0b0; font-size: 12px; margin-top: 4px; }
-  .legend i { display: inline-block; width: 10px; height: 3px; margin: 0 4px 2px 10px; vertical-align: middle; }
+  .legend span { margin-right: 10px; white-space: nowrap; }
+  .legend i { display: inline-block; width: 14px; height: 3px; margin: 0 4px 2px 0; vertical-align: middle; }
+  .legend i.dash, .legend i.dot { height: 0; background: transparent; }
+  .legend i.dash { border-top: 2px dashed; }
+  .legend i.dot { border-top: 2px dotted; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #2a3440; }
   th { color: #8ea0b0; font-weight: 500; }
@@ -44,10 +53,15 @@ PAGE = """<!DOCTYPE html>
   <h1>SPY paper session</h1>
   <p class="sub" id="status">Loading the latest snapshot…</p>
   <section class="stats" id="stats"></section>
-  <h2>Spot, VWAP, bands, and 0DTE walls</h2>
-  <p class="sub">Dollars. Clock labels are Eastern. Candles are the one-minute bar. 1σ and 2σ are the expected move still left in the session, spot × ATM IV × sqrt(minutes left / (390 × 252)), centered on VWAP. A secondary wall is dashed, and only drawn when its dollar gamma is at least 80% of the primary.</p>
+  <section id="price-panel">
+  <div class="panel-head">
+    <h2>Spot, VWAP, bands, and 0DTE walls</h2>
+    <button type="button" id="fullscreen">Full screen</button>
+  </div>
+  <p class="sub">Dollars. Clock labels are Eastern. Candles are the one-minute bar. The dotted purple lines are the 1σ move still left in the session, spot × ATM IV × sqrt(minutes left / (390 × 252)), centered on VWAP. They move toward VWAP as the session runs out. A secondary wall is dashed in the wall's own color, and only drawn when its dollar gamma is at least 80% of the primary.</p>
   <div id="price" class="chart"></div>
-  <div class="legend"><i style="background:#7dcea0"></i>Up<i style="background:#e06c75"></i>Down<i style="background:#8aa0b4"></i>VWAP<i style="background:#6d8eae"></i>1σ<i style="background:#9eb6c9"></i>2σ<i style="background:#e06c75"></i>Call wall<i style="background:#e06c75"></i>Call 2<i style="background:#7dcea0"></i>Put wall<i style="background:#7dcea0"></i>Put 2<i style="background:#e6c07b"></i>Zero gamma</div>
+  <div class="legend"><span><i style="background:#7dcea0"></i>Up</span><span><i style="background:#e06c75"></i>Down</span><span><i style="background:#8aa0b4"></i>VWAP</span><span><i class="dot" style="border-color:#c084fc"></i>1σ</span><span><i style="background:#e06c75"></i>Call wall</span><span><i class="dash" style="border-color:#e06c75"></i>Call 2</span><span><i style="background:#7dcea0"></i>Put wall</span><span><i class="dash" style="border-color:#7dcea0"></i>Put 2</span><span><i style="background:#e6c07b"></i>Zero gamma</span></div>
+  </section>
   <h2>Cumulative delta flow</h2>
   <p class="sub">Share-delta, in millions.</p>
   <div id="cdf" class="chart short"></div>
@@ -183,10 +197,11 @@ function render(data) {
     ["Total net GEX", gexText(latest.total_net_gex)],
     ["Volume GEX", gexText(latest.gex_volume)],
     ["1% hedge", gexText(latest.hedge_1pct)],
+    ["Charm to close", gexText(latest.charm_hedge)],
     ["30–90 DTE GEX", gexText(latest.macro_gex)],
     ["Zero gamma", num(latest.zero_gamma, 2)],
-    ["2σ high", num(latest.upper_2, 2)],
-    ["2σ low", num(latest.lower_2, 2)],
+    ["1σ high", num(latest.upper_1, 2)],
+    ["1σ low", num(latest.lower_1, 2)],
     ["ATM IV", latest.atm_iv == null ? "—" : num(latest.atm_iv, 2) + "%"],
     ["HMM", latest.hmm == null ? "—" : String(latest.hmm)],
     ["Macro flip", num(latest.gamma_flip, 2)],
@@ -203,10 +218,8 @@ function render(data) {
   candleSeries(price).setData(candleData(data.price || []));
   series(price, "vwap", { color: "#8aa0b4", lineWidth: 1, title: "VWAP", priceLineVisible: false }).setData(lineData(data.price || [], "vwap"));
   const quiet = { lineWidth: 1, priceLineVisible: false, lastValueVisible: false, title: "" };
-  series(price, "u1", { ...quiet, color: "#6d8eae", lineStyle: LightweightCharts.LineStyle.Dotted }).setData(lineData(data.price || [], "upper_1"));
-  series(price, "l1", { ...quiet, color: "#6d8eae", lineStyle: LightweightCharts.LineStyle.Dotted }).setData(lineData(data.price || [], "lower_1"));
-  series(price, "u2", { ...quiet, color: "#9eb6c9", lineStyle: LightweightCharts.LineStyle.Dashed }).setData(lineData(data.price || [], "upper_2"));
-  series(price, "l2", { ...quiet, color: "#9eb6c9", lineStyle: LightweightCharts.LineStyle.Dashed }).setData(lineData(data.price || [], "lower_2"));
+  series(price, "u1", { ...quiet, color: "#c084fc", lineStyle: LightweightCharts.LineStyle.Dotted }).setData(lineData(data.price || [], "upper_1"));
+  series(price, "l1", { ...quiet, color: "#c084fc", lineStyle: LightweightCharts.LineStyle.Dotted }).setData(lineData(data.price || [], "lower_1"));
   series(price, "call", { color: "#e06c75", lineWidth: 2, title: "Call wall", priceLineVisible: false }).setData(lineData(data.price || [], "call_wall"));
   setLine(price, "call2", { ...quiet, color: "#e06c75", lineStyle: LightweightCharts.LineStyle.Dashed }, data.price || [], "call_wall_2");
   series(price, "put", { color: "#7dcea0", lineWidth: 2, title: "Put wall", priceLineVisible: false }).setData(lineData(data.price || [], "put_wall"));
@@ -222,7 +235,7 @@ function render(data) {
   price.series.candle.setMarkers(markers);
   const scaleValues = [];
   for (const row of data.price || []) {
-    for (const key of ["high", "low", "spot", "upper_2", "lower_2"]) {
+    for (const key of ["high", "low", "spot", "upper_1", "lower_1"]) {
       if (row[key] != null) scaleValues.push(row[key]);
     }
   }
@@ -231,7 +244,7 @@ function render(data) {
     const high = Math.max(...scaleValues);
     const pad = 0.15;
     const provider = () => ({ priceRange: { minValue: low - pad, maxValue: high + pad } });
-    for (const name of ["candle", "vwap", "u1", "l1", "u2", "l2", "call", "call2", "put", "put2", "zero"]) {
+    for (const name of ["candle", "vwap", "u1", "l1", "call", "call2", "put", "put2", "zero"]) {
       if (price.series[name]) price.series[name].applyOptions({ autoscaleInfoProvider: provider });
     }
   }
@@ -286,6 +299,20 @@ async function refresh() {
     document.getElementById("status").textContent = "Could not read the session file. " + error.message;
   }
 }
+const pricePanel = document.getElementById("price-panel");
+const fullButton = document.getElementById("fullscreen");
+function toggleFull(force) {
+  const on = force == null ? !pricePanel.classList.contains("fullscreen") : force;
+  pricePanel.classList.toggle("fullscreen", on);
+  fullButton.textContent = on ? "Exit" : "Full screen";
+  const box = document.getElementById("price");
+  const chart = charts.price && charts.price.chart;
+  if (chart) requestAnimationFrame(() => chart.resize(box.clientWidth, box.clientHeight));
+}
+fullButton.addEventListener("click", () => toggleFull());
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && pricePanel.classList.contains("fullscreen")) toggleFull(false);
+});
 refresh();
 setInterval(refresh, 60000);
 </script>

@@ -22,6 +22,9 @@ PIN_FRACTION = 0.0015
 IV_STABLE_PAD = 0.002
 IV_SPIKE = 0.005
 CDF_FLAT_FRACTION = 0.05
+# A one-minute CDF endpoint can look flat after a round trip. Require the
+# same three-poll confirmation the walls use before a flow exit.
+CDF_FLAT_CONFIRM = 3
 
 
 @dataclass(frozen=True)
@@ -532,6 +535,12 @@ def round_trip_fees(contracts: int, n_legs: int, fee_per_contract: float = 0.65)
 
 def cdf_flattened(cdf_now: float, cdf_prev: float) -> bool:
     return abs(cdf_now - cdf_prev) <= CDF_FLAT_FRACTION * max(abs(cdf_now), abs(cdf_prev), 1.0)
+
+
+def next_cdf_flat_streak(streak: int, is_flat: bool) -> tuple[int, bool]:
+    """Advance the consecutive-poll count. The second value is true once it holds."""
+    streak = streak + 1 if is_flat else 0
+    return streak, streak >= CDF_FLAT_CONFIRM
 
 
 def reverted_to_mean(

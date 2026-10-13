@@ -14,6 +14,10 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+from scipy.stats import norm
+
+from event_calendar import session_close_time
+from ta_engine import minutes_remaining
 
 
 def calculate_strike_gex(option_fields: pd.DataFrame, spot_price: float) -> pd.DataFrame:
@@ -108,6 +112,7 @@ class IntradayGEXSnapshot:
     put_gex: float
     cdf: float
     atm_iv: float
+    charm_hedge: float
 
 
 def _as_eastern(moment: datetime | pd.Timestamp) -> pd.Timestamp:
@@ -230,6 +235,113 @@ def normalized_gex(net: float, spot: float) -> float:
     if not np.isfinite(net) or not np.isfinite(spot):
         return float("nan")
     return float(net) * 0.01 * float(spot)
+
+
+# Close enough for SPY charm and gamma. Rate and dividend barely move either greek.
+RISK_FREE = 0.04
+DIVIDEND_YIELD = 0.012
+MINUTES_PER_YEAR = 365 * 24 * 60
+
+
+def _year_fraction(minutes_left: float) -> float:
+    """Calendar years until the close. One minute is the floor, so 16:00 does not divide by zero."""
+    return max(float(minutes_left), 1.0) / MINUTES_PER_YEAR
+
+
+def _minutes_to_close(as_of: datetime | pd.Timestamp) -> float:
+    stamp = _as_eastern(as_of)
+    return minutes_remaining(stamp.to_pydatetime(), session_close_time(stamp.date()))
+
+
+def _d1_d2(spot: float, strike: np.ndarray, t_years: float, sigma: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    sqrt_t = float(np.sqrt(t_years))
+    vol_sqrt = sigma * sqrt_t
+    with np.errstate(divide="ignore", invalid="ignore"):
+        d1 = (np.log(spot / strike) + (RISK_FREE - DIVIDEND_YIELD + 0.5 * sigma**2) * t_years) / vol_sqrt
+    return d1, d1 - vol_sqrt
+
+
+def black_scholes_gamma(spot: float, strike: Any, t_years: float, sigma: Any) -> np.ndarray:
+    """Black-Scholes gamma at the live spot and each strike's own implied vol."""
+    strike_array = np.asarray(strike, dtype=float)
+    vol = np.asarray(sigma, dtype=float)
+    d1, _ = _d1_d2(spot, strike_array, t_years, vol)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        gamma = np.exp(-DIVIDEND_YIELD * t_years) * norm.pdf(d1) / (spot * vol * np.sqrt(t_years))
+    good = np.isfinite(gamma) & (vol > 0) & (strike_array > 0) & (spot > 0)
+    return np.where(good, gamma, 0.0)
+
+
+def black_scholes_charm(spot: float, strike: Any, t_years: float, sigma: Any, option_type: str) -> np.ndarray:
+    """Change in delta per year of time passing. Calls and puts use the same d1 and d2."""
+    strike_array = np.asarray(strike, dtype=float)
+    vol = np.asarray(sigma, dtype=float)
+    d1, d2 = _d1_d2(spot, strike_array, t_years, vol)
+    sqrt_t = np.sqrt(t_years)
+    discount = np.exp(-DIVIDEND_YIELD * t_years)
+    cdf = norm.cdf(d1 if option_type == "call" else -d1)
+    term1 = DIVIDEND_YIELD * discount * cdf
+    numer = 2 * (RISK_FREE - DIVIDEND_YIELD) * t_years - d2 * vol * sqrt_t
+    denom = 2 * t_years * sqrt_t * vol
+    with np.errstate(divide="ignore", invalid="ignore"):
+        term2 = discount * norm.pdf(d1) * (numer / denom)
+    charm = (term1 - term2) if option_type == "call" else (-term1 - term2)
+    good = np.isfinite(charm) & (vol > 0) & (strike_array > 0) & (spot > 0)
+    return np.where(good, charm, 0.0)
+
+
+def _book_weights(
+    chain: pd.DataFrame,
+    as_of: datetime | pd.Timestamp,
+    minutes_left: float,
+) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, float]:
+    frame = chain.sort_values("strikePrice")
+    strikes = frame["strikePrice"].to_numpy(dtype=float)
+    call_weight = positioning_weight(frame["call_openInterest"], frame["call_volume"], as_of)
+    put_weight = positioning_weight(frame["put_openInterest"], frame["put_volume"], as_of)
+    return frame, strikes, call_weight, put_weight, _year_fraction(minutes_left)
+
+
+def iv_net_dollar_gamma(
+    chain: pd.DataFrame,
+    spot: float,
+    as_of: datetime | pd.Timestamp,
+    minutes_left: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Dollar-gamma book rebuilt from live spot and each strike's implied vol.
+
+    Same weights and sign as the regime book. Gamma itself is Black-Scholes
+    at the current spot, so the zero-gamma strike moves when IV moves.
+    """
+    frame, strikes, call_weight, put_weight, t_years = _book_weights(chain, as_of, minutes_left)
+    call_gamma = black_scholes_gamma(spot, strikes, t_years, frame["call_volatility"].to_numpy(dtype=float))
+    put_gamma = black_scholes_gamma(spot, strikes, t_years, frame["put_volatility"].to_numpy(dtype=float))
+    net = dollar_gamma(call_gamma, call_weight, spot) - dollar_gamma(put_gamma, put_weight, spot)
+    return strikes, net
+
+
+def charm_to_close(
+    chain: pd.DataFrame,
+    spot: float,
+    as_of: datetime | pd.Timestamp,
+    minutes_left: float,
+) -> float:
+    """
+    Dollars of underlying the signed book must trade by the close as delta decays.
+
+    Charm is Black-Scholes dDelta per year elapsed. Positive means the book's
+    delta rises into the close, so a hedge sells shares. Calls minus puts,
+    with the same positioning weight as the regime book.
+    """
+    if chain.empty or not np.isfinite(minutes_left) or minutes_left <= 0 or not np.isfinite(spot) or spot <= 0:
+        return 0.0
+    frame, strikes, call_weight, put_weight, t_years = _book_weights(chain, as_of, minutes_left)
+    call_charm = black_scholes_charm(spot, strikes, t_years, frame["call_volatility"].to_numpy(dtype=float), "call")
+    put_charm = black_scholes_charm(spot, strikes, t_years, frame["put_volatility"].to_numpy(dtype=float), "put")
+    shares_per_year = np.sum((call_charm * call_weight - put_charm * put_weight) * CONTRACT_MULTIPLIER)
+    shares = float(shares_per_year) * (float(minutes_left) / MINUTES_PER_YEAR)
+    return shares * float(spot)
 
 
 def rank_gamma_walls(
@@ -482,9 +594,11 @@ def build_intraday_snapshot(
     spot: float,
     as_of: datetime | pd.Timestamp,
 ) -> IntradayGEXSnapshot:
-    """Reduce one 0DTE chain to walls, zero gamma, CDF, and ATM IV."""
+    """Reduce one 0DTE chain to walls, zero gamma, CDF, ATM IV, and charm."""
     exposure = strike_exposure_frame(chain, spot, as_of)
     net = exposure["net_dollar_gamma"].to_numpy(dtype=float)
+    minutes_left = _minutes_to_close(as_of)
+    iv_strikes, iv_net = iv_net_dollar_gamma(chain, float(spot), as_of, minutes_left)
     call_exposure = oi_dollar_gamma(chain["call_gamma"], chain["call_openInterest"], float(spot))
     put_exposure = oi_dollar_gamma(chain["put_gamma"], chain["put_openInterest"], float(spot))
     call_1, call_1_g, call_2, call_2_g = rank_gamma_walls(chain["strikePrice"], call_exposure)
@@ -500,7 +614,7 @@ def build_intraday_snapshot(
         call_wall_2_gamma=call_2_g,
         put_wall_1_gamma=put_1_g,
         put_wall_2_gamma=put_2_g,
-        zero_gamma=zero_gamma_level(exposure["strikePrice"], net, spot=float(spot)),
+        zero_gamma=zero_gamma_level(iv_strikes, iv_net, spot=float(spot)),
         net_gex=float(np.nansum(net)),
         call_gex=float(np.nansum(exposure["call_dollar_gamma"])),
         put_gex=float(np.nansum(exposure["put_dollar_gamma"])),
@@ -516,6 +630,7 @@ def build_intraday_snapshot(
             chain["put_volatility"],
             float(spot),
         ),
+        charm_hedge=charm_to_close(chain, float(spot), as_of, minutes_left),
     )
 
 

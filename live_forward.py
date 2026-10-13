@@ -58,6 +58,7 @@ from live_signals import (
     cascade_signal,
     cdf_flattened,
     charm_pin_active,
+    next_cdf_flat_streak,
     contract_count,
     credit_legs,
     debit_legs,
@@ -117,6 +118,7 @@ class MarketSnapshot:
     gex_0_1: float | None
     total_net_gex: float | None
     gex_volume: float | None
+    charm_hedge: float | None
     bar_open: float
     bar_high: float
     bar_low: float
@@ -191,6 +193,7 @@ class ForwardTester:
         self._call_wall_2_state = LevelState()
         self._put_wall_2_state = LevelState()
         self._zero_gamma_state = LevelState()
+        self._cdf_flat_streak = 0
         self._setup_database()
         self._load_state()
 
@@ -241,6 +244,7 @@ class ForwardTester:
             ("bar_high", "DOUBLE"),
             ("bar_low", "DOUBLE"),
             ("bar_close", "DOUBLE"),
+            ("charm_hedge", "DOUBLE"),
         ):
             self.db.execute(f"ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS {name} {kind}")
         self.db.execute(
@@ -360,7 +364,7 @@ class ForwardTester:
         self._remember_flow(snap)
         self._publish_view()
         logging.info(
-            "STATE | spot=%.2f | iGEX=%s | mGEX=%s | HMM=%s | OU=%s | blackout=%s | charm=%s",
+            "STATE | spot=%.2f | iGEX=%s | mGEX=%s | HMM=%s | OU=%s | blackout=%s | charm=%s | charm$=%s",
             snap.spot,
             _compact(snap.intrad_gex),
             _compact(snap.macro_gex),
@@ -368,6 +372,7 @@ class ForwardTester:
             f"{snap.ou_theta:.4f}" if snap.ou_theta is not None else "—",
             snap.blackout or "—",
             "on" if snap.charm else "off",
+            _compact(snap.charm_hedge),
         )
         for event in events:
             self._discord_event(snap, event)
@@ -479,6 +484,7 @@ class ForwardTester:
             gex_0_1=gex_0_1,
             total_net_gex=gex_0_1 + float(macro_gex),
             gex_volume=volume_gex(chain, spot),
+            charm_hedge=_finite(intrad.charm_hedge),
             bar_open=float(candle["Open"]),
             bar_high=float(candle["High"]),
             bar_low=float(candle["Low"]),
@@ -558,6 +564,8 @@ class ForwardTester:
             closed = self._odte_exit(name, snap)
             if closed is not None:
                 events.append(closed)
+        if "cascade" not in self.positions:
+            self._cdf_flat_streak = 0
         if "macro" in self.positions and self._macro_should_exit(snap):
             closed = self._close_position(
                 "macro",
@@ -590,7 +598,7 @@ class ForwardTester:
                     allow_intrinsic=True,
                 )
         reason = self._profit_reason(name, position, snap)
-        if reason is None:
+        if reason is None or not self._exit_is_profitable(name, snap):
             return None
         return self._close_position(name, snap, "TAKE_PROFIT", reason, allow_intrinsic=False)
 
@@ -632,16 +640,25 @@ class ForwardTester:
             ):
                 return "spot reverted to VWAP or zero gamma"
             return None
-        if marked is None:
-            return None
-        if position["direction"] == "bullish" and math.isfinite(snap.upper_2) and snap.spot >= snap.upper_2:
+        if marked is not None and position["direction"] == "bullish" and math.isfinite(snap.upper_2) and snap.spot >= snap.upper_2:
             return "spot reached the upper 2σ band"
-        if position["direction"] == "bearish" and math.isfinite(snap.lower_2) and snap.spot <= snap.lower_2:
+        if marked is not None and position["direction"] == "bearish" and math.isfinite(snap.lower_2) and snap.spot <= snap.lower_2:
             return "spot reached the lower 2σ band"
         previous = value_at_or_before(self.cdf_history, snap.now - timedelta(minutes=15))
-        if snap.cdf is not None and previous is not None and cdf_flattened(snap.cdf, previous):
+        flat = snap.cdf is not None and previous is not None and cdf_flattened(snap.cdf, previous)
+        self._cdf_flat_streak, confirmed = next_cdf_flat_streak(self._cdf_flat_streak, flat)
+        if confirmed and marked is not None:
             return "cumulative delta flow flattened"
         return None
+
+    def _exit_is_profitable(self, name: str, snap: MarketSnapshot) -> bool:
+        """A take-profit close has to be green after round-trip fees."""
+        position = self.positions[name]
+        marked = self._marked_net(position, snap.chain)
+        if marked is None:
+            return False
+        fees = round_trip_fees(int(position["contracts"]), len(position["legs"]), FEE_PER_CONTRACT)
+        return trade_pnl(float(position["entry_net"]), marked, int(position["contracts"]), fees) > 0
 
     def _macro_should_exit(self, snap: MarketSnapshot) -> bool:
         position = self.positions["macro"]
@@ -945,7 +962,7 @@ class ForwardTester:
                 "charm_guard", "entry_block_reason",
                 "call_wall_1_strike", "call_wall_1_gamma", "call_wall_2_strike", "call_wall_2_gamma",
                 "put_wall_1_strike", "put_wall_1_gamma", "put_wall_2_strike", "put_wall_2_gamma",
-                "gex_0_1", "total_net_gex", "gex_volume",
+                "gex_0_1", "total_net_gex", "gex_volume", "charm_hedge",
                 "bar_open", "bar_high", "bar_low", "bar_close",
             ]
             self.db.execute(
@@ -987,6 +1004,7 @@ class ForwardTester:
                     _db_float(snap.gex_0_1),
                     _db_float(snap.total_net_gex),
                     _db_float(snap.gex_volume),
+                    _db_float(snap.charm_hedge),
                     _db_float(snap.bar_open),
                     _db_float(snap.bar_high),
                     _db_float(snap.bar_low),
@@ -1063,6 +1081,7 @@ class ForwardTester:
             })),
             "cooldowns": dict(self.cooldowns),
             "last_signal_bar": self.last_signal_bar,
+            "cdf_flat_streak": self._cdf_flat_streak,
             "prior_hmm": self.prior_hmm,
             "closing_hmm": self.closing_hmm,
             "previous_close": self.previous_close,
@@ -1080,6 +1099,7 @@ class ForwardTester:
         }
         self.cooldowns = dict(checkpoint["cooldowns"])
         self.last_signal_bar = checkpoint["last_signal_bar"]
+        self._cdf_flat_streak = checkpoint["cdf_flat_streak"]
         self.prior_hmm = checkpoint["prior_hmm"]
         self.closing_hmm = checkpoint["closing_hmm"]
         self.previous_close = checkpoint["previous_close"]
@@ -1257,6 +1277,7 @@ def _metrics_json(snap: MarketSnapshot) -> str:
             "pin_strike": snap.pin_strike,
             "blackout": snap.blackout,
             "charm_guard": snap.charm,
+            "charm_hedge": snap.charm_hedge,
             "macro_expiration": snap.macro_expiration,
             "macro_dte": snap.macro_dte,
         },
@@ -1281,7 +1302,7 @@ def _metrics_text(snap: MarketSnapshot) -> str:
             ),
             (
                 f"Pin {_level(snap.pin_strike)} | Blackout {snap.blackout or '—'} | "
-                f"Charm {'on' if snap.charm else 'off'}"
+                f"Charm pin {'on' if snap.charm else 'off'} | Charm to close {_compact(snap.charm_hedge)}"
             ),
         ]
     )

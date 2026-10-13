@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import tempfile
 from datetime import date, datetime, time
@@ -289,6 +290,7 @@ def _snapshot() -> "MarketSnapshot":
         gex_0_1=1.0,
         total_net_gex=2.0,
         gex_volume=3.0,
+        charm_hedge=0.0,
         bar_open=499,
         bar_high=501,
         bar_low=498,
@@ -557,6 +559,72 @@ def test_walls_expected_move_and_secondary_rules() -> None:
     assert confirmed is not None and confirmed.anchor == 112
 
 
+def test_charm_and_iv_zero_gamma() -> None:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from scipy.stats import norm
+
+    from gex_engine import (
+        DIVIDEND_YIELD,
+        RISK_FREE,
+        black_scholes_charm,
+        black_scholes_gamma,
+        build_intraday_snapshot,
+        charm_to_close,
+    )
+
+    spot, strike, sigma, t_years = 100.0, 100.0, 0.20, 1.0 / 252.0
+    sqrt_t = t_years ** 0.5
+    d1 = (math.log(spot / strike) + (RISK_FREE - DIVIDEND_YIELD + 0.5 * sigma**2) * t_years) / (sigma * sqrt_t)
+    d2 = d1 - sigma * sqrt_t
+    discount = math.exp(-DIVIDEND_YIELD * t_years)
+    term1 = DIVIDEND_YIELD * discount * norm.cdf(d1)
+    term2 = discount * norm.pdf(d1) * (
+        (2 * (RISK_FREE - DIVIDEND_YIELD) * t_years - d2 * sigma * sqrt_t) / (2 * t_years * sqrt_t * sigma)
+    )
+    charm = black_scholes_charm(spot, [strike], t_years, [sigma], "call")
+    assert abs(float(charm[0]) - (term1 - term2)) < 1e-9
+    gamma = black_scholes_gamma(spot, [100.0, 150.0], t_years, [0.2, 0.2])
+    assert gamma[0] > gamma[1] > 0
+
+    def chain(put_iv: float) -> pd.DataFrame:
+        return pd.DataFrame({
+            "strikePrice": [99.0, 100.0, 101.0],
+            "call_openInterest": [40, 100, 900],
+            "call_gamma": [0.01, 0.02, 0.01],
+            "call_delta": [0.6, 0.5, 0.4],
+            "call_volatility": [0.16, 0.16, 0.16],
+            "call_volume": [1, 1, 1],
+            "put_openInterest": [900, 100, 40],
+            "put_gamma": [0.01, 0.02, 0.01],
+            "put_delta": [-0.4, -0.5, -0.6],
+            "put_volatility": [put_iv, put_iv, put_iv],
+            "put_volume": [1, 1, 1],
+        })
+
+    as_of = datetime(2026, 10, 13, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+    calm = build_intraday_snapshot(chain(0.12), 100.0, as_of)
+    stressed = build_intraday_snapshot(chain(0.16), 100.0, as_of)
+    assert calm.zero_gamma is not None and stressed.zero_gamma is not None
+    assert stressed.zero_gamma != calm.zero_gamma
+    assert calm.charm_hedge != 0
+    assert charm_to_close(chain(0.2), 100.0, as_of, 0) == 0
+
+
+def test_cdf_flat_needs_three_polls() -> None:
+    from live_signals import next_cdf_flat_streak
+
+    streak = 0
+    for _ in range(2):
+        streak, confirmed = next_cdf_flat_streak(streak, True)
+        assert not confirmed
+    streak, confirmed = next_cdf_flat_streak(streak, True)
+    assert streak == 3 and confirmed
+    streak, confirmed = next_cdf_flat_streak(streak, False)
+    assert streak == 0 and not confirmed
+
+
 def test_level_spikes_are_held() -> None:
     from gex_engine import LevelState, stabilize_level, stabilize_series
 
@@ -595,4 +663,6 @@ if __name__ == "__main__":
     test_paper_absorption_roundtrip()
     test_level_spikes_are_held()
     test_walls_expected_move_and_secondary_rules()
+    test_charm_and_iv_zero_gamma()
+    test_cdf_flat_needs_three_polls()
     print("forward logic checks passed")

@@ -68,6 +68,7 @@ def build_live_view(db) -> dict[str, Any]:
             "gex_0_1",
             "total_net_gex",
             "gex_volume",
+            "charm_hedge",
             "bar_open",
             "bar_high",
             "bar_low",
@@ -183,6 +184,7 @@ def build_live_view(db) -> dict[str, Any]:
             "gex_0_1": gex[-1]["near"] if gex else None,
             "total_net_gex": gex[-1]["total"] if gex else None,
             "gex_volume": gex[-1].get("volume") if gex else None,
+            "charm_hedge": _num(_extra(last, "charm_hedge")),
             "hedge_1pct": (
                 _num(normalized_gex(gex[-1]["total"], float(last[1])))
                 if gex and gex[-1]["total"] is not None and last[1] is not None

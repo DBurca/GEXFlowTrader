@@ -96,7 +96,7 @@ Two gamma books are kept on purpose. The regime sign uses the intraday dollar-ga
 Dollar Gamma = Gamma × weight × 100 × Spot² × 0.01
 ```
 
-Put dollar gamma is signed negative. Net intraday GEX is the sum. Zero gamma is the interpolated cumulative-zero closest to spot.
+Put dollar gamma is signed negative. Net intraday GEX is the sum. Zero gamma is the interpolated cumulative-zero closest to spot. The gamma in that zero-gamma book is Black-Scholes, marked at the live spot and each strike's own implied vol (`r = 0.04`, `q = 0.012`), with the same weights as the regime book. The regime sign still uses Schwab's quoted gamma. Cascade reads this zero-gamma strike, so an IV change moves the breakout level.
 
 **Wall rank and GEX magnitude:**
 
@@ -127,6 +127,8 @@ Absorption and cascade use these bands, so a 1σ test and a 2σ target tighten a
 **Volume GEX** is the same strike sum as the wall formula with session volume in place of open interest, on the 0DTE book only. It is drawn on the GEX chart. The regime sign stays on the dollar-gamma book.
 
 **1% hedge** is `total net GEX × 0.01 × spot`: the dollars of underlying that hedge a 1% move.
+
+**Charm to close** is the dollars of underlying the same signed book must trade by the cash close as delta decays. Charm is Black-Scholes `dDelta` per year of time passing, times the minutes still left, times 100, times spot. Calls minus puts. A positive figure means delta rises into the close, so the hedge sells shares. It is a published stat. The last-hour entry block is still the max-open-interest pin, not this greek.
 
 ATM IV is the average of the call and put implied vol at the strike nearest spot.
 
@@ -173,10 +175,12 @@ flowchart TD
 | Trigger | 5-minute test of the put wall, call wall, 1σ, or 2σ that fails to close through. A wall wins when both a wall and a band qualify | 5-minute close through `call_wall_2` on the upside, or `put_wall_2` on the downside, when that secondary wall exists. Otherwise the primary wall or zero gamma. Price must be on the correct side of VWAP | Same-day check during the closing 5 minutes |
 | Structure | 0DTE credit, short strike at the tested level, long strike one strike further out | 0DTE debit, about $2 wide, long strike nearest spot | 30–60 DTE put debit, about $5 wide, expiration nearest 45 DTE |
 | Stop | Close back through the tested level, with CDF confirming. A 1σ fade uses the secondary wall as that level when the secondary exists | Close back through zero gamma | Next session: HMM back in state 0. Or, in the closing 5 minutes, spot back above the flip or macro GEX ≥ 0 |
-| Take profit | Half the credit, or spot back to VWAP or zero gamma | Spot reaches the 2σ band in the trade direction, or CDF flattens | The exit rules above |
+| Take profit | Half the credit, or spot back to VWAP or zero gamma. Taken only when the close is green after fees | Spot reaches the 2σ band in the trade direction, or CDF stays flat for three polls. Taken only when the close is green after fees | The exit rules above |
 | Flatten | Last 5 minutes | Last 5 minutes | Held overnight |
 
 A quote is skipped when the combined bid-ask width is more than `SPREAD_BA_MAX_RATIO` (default 5%) of the structure's mid value, when the premium is under $0.05, or when the credit or debit is wider than the strikes. The charm guard blocks new entries in the last hour when spot is within 0.15% of the 0DTE strike with the most open interest.
+
+A take-profit event is written only when the marked close is positive after fees. A red absorption fade, a red 2σ touch, or a red CDF reading stays open for the stop or the session flatten. Cascade's CDF exit also waits until the 15-minute change has been inside 5% of the cumulative CDF for three polls in a row. One quiet minute does not close it.
 
 ## Paper account
 
@@ -242,18 +246,17 @@ erDiagram
 | --- | --- |
 | Price | One-minute candles |
 | VWAP | Solid gray |
-| 1σ | Dotted blue, remaining-session expected move around VWAP |
-| 2σ | Dashed blue |
+| 1σ | Dotted purple, remaining-session expected move around VWAP |
 | Call wall 1 | Solid red |
 | Call wall 2 | Dashed red, omitted when null |
 | Put wall 1 | Solid green |
 | Put wall 2 | Dashed green, omitted when null |
 | Zero gamma | Solid gold |
 | Net GEX | Total, 0–1 DTE, 0DTE volume, and 30–90 DTE |
-| Price | One-minute candles, VWAP, remaining-session 1σ and 2σ, walls |
+| Price | One-minute candles, VWAP, remaining-session 1σ, walls |
 | PnL | Change from each balance at the session open |
 
-Clock labels are America/New_York. The price scale follows spot and the 2σ bands so a wall outside that range does not flatten the session.
+Clock labels are America/New_York. The price scale follows spot and the 1σ bands so a wall outside that range does not flatten the session. The 2σ levels stay in the signal logic: absorption can still fade a failed 2σ test, and cascade still takes profit when spot reaches 2σ. They are not drawn.
 
 ## Layout
 
