@@ -13,8 +13,9 @@ import os
 from datetime import datetime
 from typing import Any
 
-from gex_engine import stabilize_optional_series, stabilize_series
-from ta_engine import expected_move_bands
+from event_calendar import session_close_time
+from gex_engine import normalized_gex, stabilize_optional_series, stabilize_series
+from ta_engine import expected_move_bands, minutes_remaining
 
 STRATEGIES = ("absorption", "cascade", "macro")
 
@@ -61,7 +62,17 @@ def build_live_view(db) -> dict[str, Any]:
     available = {row[0] for row in db.execute("DESCRIBE snapshots").fetchall()}
     extra_names = [
         name
-        for name in ("call_wall_2_strike", "put_wall_2_strike", "gex_0_1", "total_net_gex")
+        for name in (
+            "call_wall_2_strike",
+            "put_wall_2_strike",
+            "gex_0_1",
+            "total_net_gex",
+            "gex_volume",
+            "bar_open",
+            "bar_high",
+            "bar_low",
+            "bar_close",
+        )
         if name in available
     ]
     rows = db.execute(
@@ -105,19 +116,31 @@ def build_live_view(db) -> dict[str, Any]:
         spot = _num(row[1])
         vwap = _num(row[7])
         atm_iv = _num(row[6])
+        stamped = datetime.fromisoformat(str(row[0]))
         upper_1, lower_1, upper_2, lower_2 = expected_move_bands(
             float("nan") if vwap is None else vwap,
             float("nan") if spot is None else spot,
             float("nan") if atm_iv is None else atm_iv,
+            minutes_remaining(stamped, session_close_time(stamped.date())),
         )
         macro_gex = _num(row[13])
         near_gex = _num(_extra(row, "gex_0_1"))
         total_gex = _num(_extra(row, "total_net_gex"))
         if total_gex is None and near_gex is not None and macro_gex is not None:
             total_gex = near_gex + macro_gex
+        bar_open = _num(_extra(row, "bar_open"))
+        bar_high = _num(_extra(row, "bar_high"))
+        bar_low = _num(_extra(row, "bar_low"))
+        bar_close = _num(_extra(row, "bar_close"))
+        if bar_open is None:
+            bar_open = bar_high = bar_low = bar_close = spot
         price.append({
             "time": moment,
             "spot": spot,
+            "open": bar_open,
+            "high": bar_high,
+            "low": bar_low,
+            "close": bar_close,
             "call_wall": _num(call_walls[index]),
             "put_wall": _num(put_walls[index]),
             "call_wall_2": _num(call_walls_2[index]),
@@ -139,6 +162,7 @@ def build_live_view(db) -> dict[str, Any]:
             "near": near_gex,
             "total": total_gex,
             "macro": macro_gex,
+            "volume": _num(_extra(row, "gex_volume")),
         })
         previous_time = moment
 
@@ -158,6 +182,12 @@ def build_live_view(db) -> dict[str, Any]:
             "put_wall_2": _num(put_walls_2[-1]),
             "gex_0_1": gex[-1]["near"] if gex else None,
             "total_net_gex": gex[-1]["total"] if gex else None,
+            "gex_volume": gex[-1].get("volume") if gex else None,
+            "hedge_1pct": (
+                _num(normalized_gex(gex[-1]["total"], float(last[1])))
+                if gex and gex[-1]["total"] is not None and last[1] is not None
+                else None
+            ),
             "zero_gamma": _num(zero_gammas[-1]),
             "cdf": _num(last[5]),
             "atm_iv": _percent(last[6]),

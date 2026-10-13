@@ -59,7 +59,7 @@ sequenceDiagram
     Tester->>DuckDB: commit snapshot, trades, balances
     Tester->>JSON: atomic replace
   end
-  Chart->>JSON: GET /api/session every 15 seconds
+  Chart->>JSON: GET /api/session every minute
 ```
 
 When the NYSE is closed the tester sleeps until the next 09:30 ET open and logs that time. CPI, NFP, and FOMC windows suppress new entries. The calendar covers the 2026 and 2027 NYSE holidays and early closes.
@@ -114,13 +114,19 @@ Dollar Gamma = Gamma × Open Interest × 100 × Spot
 
 A wall or zero-gamma print that jumps more than one SPY strike ($1.01) is held until the new level repeats for three polls. A one-strike step is accepted immediately. A secondary wall has to confirm for three polls before it appears, and it clears only after three polls of absence.
 
-**Expected move**, centered on VWAP:
+**Expected move** still left in the session, centered on VWAP. A full 390-minute day matches `spot × ATM IV × sqrt(1/252)`.
 
 ```text
-width = Spot × ATM IV × sqrt(1/252)
+width = Spot × ATM IV × sqrt(minutes left / (390 × 252))
 1σ    = VWAP ± width
 2σ    = VWAP ± 2 × width
 ```
+
+Absorption and cascade use these bands, so a 1σ test and a 2σ target tighten as the close approaches.
+
+**Volume GEX** is the same strike sum as the wall formula with session volume in place of open interest, on the 0DTE book only. It is drawn on the GEX chart. The regime sign stays on the dollar-gamma book.
+
+**1% hedge** is `total net GEX × 0.01 × spot`: the dollars of underlying that hedge a 1% move.
 
 ATM IV is the average of the call and put implied vol at the strike nearest spot.
 
@@ -230,20 +236,21 @@ erDiagram
 
 ## Chart
 
-[http://129.146.241.140:8080/](http://129.146.241.140:8080/) polls `/api/session` every 15 seconds. `/health` returns `ok`.
+[http://129.146.241.140:8080/](http://129.146.241.140:8080/) polls `/api/session` once a minute, on the same cadence as the snapshot write. `/health` returns `ok`.
 
 | Series | Drawing |
 | --- | --- |
-| Spot | Solid white |
+| Price | One-minute candles |
 | VWAP | Solid gray |
-| 1σ | Dotted blue, expected move around VWAP |
+| 1σ | Dotted blue, remaining-session expected move around VWAP |
 | 2σ | Dashed blue |
 | Call wall 1 | Solid red |
 | Call wall 2 | Dashed red, omitted when null |
 | Put wall 1 | Solid green |
 | Put wall 2 | Dashed green, omitted when null |
 | Zero gamma | Solid gold |
-| Net GEX | Total, 0–1 DTE, and 30–90 DTE |
+| Net GEX | Total, 0–1 DTE, 0DTE volume, and 30–90 DTE |
+| Price | One-minute candles, VWAP, remaining-session 1σ and 2σ, walls |
 | PnL | Change from each balance at the session open |
 
 Clock labels are America/New_York. The price scale follows spot and the 2σ bands so a wall outside that range does not flatten the session.

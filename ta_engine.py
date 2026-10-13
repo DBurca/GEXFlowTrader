@@ -1,9 +1,10 @@
 """
 Session VWAP and the expected-move bands the forward test publishes.
 
-VWAP starts at 09:30 ET. The levels drawn on the dashboard are
+VWAP starts at 09:30 ET. The levels drawn on the dashboard are the
+expected move still left in the session:
 
-    width = spot × ATM IV × sqrt(1/252)
+    width = spot × ATM IV × sqrt(minutes left / (390 × 252))
     band  = VWAP ± k × width
 
 ``calculate_vwap_bands`` still attaches a return-volatility width. The
@@ -13,31 +14,54 @@ forward test replaces those four band columns with ``expected_move_bands``.
 from __future__ import annotations
 
 import math
+from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 
 TRADING_DAYS = 252
+SESSION_MINUTES = 390
 
 EASTERN = ZoneInfo("America/New_York")
 RTH_OPEN_MINUTES = 9 * 60 + 30
 RTH_CLOSE_MINUTES = 16 * 60
 
 
-def expected_move(spot: float, atm_iv: float) -> float:
-    """One-day one-sigma move: spot × ATM IV × sqrt(1/252).
+def minutes_remaining(moment: datetime, close_at: time) -> float:
+    """Whole minutes from ``moment`` until the session close, never negative."""
+    now_minutes = moment.hour * 60 + moment.minute
+    close_minutes = close_at.hour * 60 + close_at.minute
+    return float(max(0, close_minutes - now_minutes))
 
-    ``atm_iv`` is a decimal (0.10 for 10 percent), not a percent.
+
+def expected_move(spot: float, atm_iv: float, minutes_left: float = SESSION_MINUTES) -> float:
+    """One-sigma move still left in the session.
+
+    ``spot × ATM IV × sqrt(minutes_left / (390 × 252))``. A full 390-minute
+    session is the old one-day move. ``atm_iv`` is a decimal.
     """
-    if not np.isfinite(spot) or not np.isfinite(atm_iv) or spot <= 0 or atm_iv <= 0:
-        return float("nan")
-    return float(spot) * float(atm_iv) * math.sqrt(1.0 / TRADING_DAYS)
+    if (
+        not np.isfinite(spot)
+        or not np.isfinite(atm_iv)
+        or not np.isfinite(minutes_left)
+        or spot <= 0
+        or atm_iv <= 0
+        or minutes_left <= 0
+    ):
+        return 0.0 if np.isfinite(minutes_left) and minutes_left <= 0 else float("nan")
+    fraction = max(float(minutes_left), 0.0) / SESSION_MINUTES
+    return float(spot) * float(atm_iv) * math.sqrt(fraction / TRADING_DAYS)
 
 
-def expected_move_bands(vwap: float, spot: float, atm_iv: float) -> tuple[float, float, float, float]:
-    """VWAP ± 1 and ± 2 expected moves. Returns upper_1, lower_1, upper_2, lower_2."""
-    width = expected_move(spot, atm_iv)
+def expected_move_bands(
+    vwap: float,
+    spot: float,
+    atm_iv: float,
+    minutes_left: float = SESSION_MINUTES,
+) -> tuple[float, float, float, float]:
+    """VWAP ± 1 and ± 2 remaining-session moves. Returns upper_1, lower_1, upper_2, lower_2."""
+    width = expected_move(spot, atm_iv, minutes_left)
     if not np.isfinite(vwap) or not np.isfinite(width):
         nan = float("nan")
         return nan, nan, nan, nan

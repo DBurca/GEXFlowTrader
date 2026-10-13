@@ -288,6 +288,11 @@ def _snapshot() -> "MarketSnapshot":
         put_wall_2_gamma=None,
         gex_0_1=1.0,
         total_net_gex=2.0,
+        gex_volume=3.0,
+        bar_open=499,
+        bar_high=501,
+        bar_low=498,
+        bar_close=500,
         zero_gamma=500,
         cdf=10,
         atm_iv=0.15,
@@ -454,8 +459,10 @@ def _five(rows: list[tuple[str, float, float, float, float]]) -> pd.DataFrame:
 
 
 def test_walls_expected_move_and_secondary_rules() -> None:
-    from gex_engine import net_gex, rank_gamma_walls
-    from ta_engine import expected_move
+    from datetime import datetime, time
+
+    from gex_engine import net_gex, normalized_gex, rank_gamma_walls, volume_gex
+    from ta_engine import expected_move, minutes_remaining
 
     strikes = [100, 101, 102]
     exposure = [10, 9, 5]
@@ -474,8 +481,17 @@ def test_walls_expected_move_and_secondary_rules() -> None:
     # times 100 * spot 500 = 25000
     assert net_gex(chain, 500) == 25000
 
+    full_day = 500 * 0.16 * (1 / 252) ** 0.5
     move = expected_move(500, 0.16)
-    assert abs(move - 500 * 0.16 * (1 / 252) ** 0.5) < 1e-9
+    assert abs(move - full_day) < 1e-9
+    assert abs(expected_move(500, 0.16, 195) - full_day * (0.5 ** 0.5)) < 1e-9
+    assert expected_move(500, 0.16, 0) == 0
+    assert minutes_remaining(datetime(2026, 10, 12, 15, 0), time(16, 0)) == 60
+    volume_chain = chain.copy()
+    volume_chain["call_volume"] = [100, 50]
+    volume_chain["put_volume"] = [40, 80]
+    assert volume_gex(volume_chain, 500) == 25000
+    assert normalized_gex(25000, 500) == 25000 * 0.01 * 500
 
     bar = _bar(100, 101, 98, 99.5)
     faded = absorption_signal(

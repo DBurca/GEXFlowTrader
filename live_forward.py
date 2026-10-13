@@ -39,6 +39,7 @@ from gex_engine import (
     classify_regime,
     stabilize_level,
     stabilize_optional_level,
+    volume_gex,
 )
 from live_market import (
     AuthError,
@@ -78,7 +79,7 @@ from live_signals import (
 )
 from live_view import publish_live_view
 from signal_engine import calculate_gamma_flip
-from ta_engine import calculate_vwap_bands, expected_move_bands
+from ta_engine import calculate_vwap_bands, expected_move_bands, minutes_remaining
 
 logging.basicConfig(
     level=logging.INFO,
@@ -115,6 +116,11 @@ class MarketSnapshot:
     put_wall_2_gamma: float | None
     gex_0_1: float | None
     total_net_gex: float | None
+    gex_volume: float | None
+    bar_open: float
+    bar_high: float
+    bar_low: float
+    bar_close: float
     zero_gamma: float | None
     cdf: float | None
     atm_iv: float | None
@@ -230,6 +236,11 @@ class ForwardTester:
             ("put_wall_2_gamma", "DOUBLE"),
             ("gex_0_1", "DOUBLE"),
             ("total_net_gex", "DOUBLE"),
+            ("gex_volume", "DOUBLE"),
+            ("bar_open", "DOUBLE"),
+            ("bar_high", "DOUBLE"),
+            ("bar_low", "DOUBLE"),
+            ("bar_close", "DOUBLE"),
         ):
             self.db.execute(f"ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS {name} {kind}")
         self.db.execute(
@@ -437,9 +448,11 @@ class ForwardTester:
             intrad.call_wall_2,
             intrad.put_wall_2,
         )
+        minutes_left = minutes_remaining(now, session_close_time(now.date()))
         upper_1, lower_1, upper_2, lower_2 = expected_move_bands(
-            float(latest["vwap"]), spot, float(intrad.atm_iv)
+            float(latest["vwap"]), spot, float(intrad.atm_iv), minutes_left
         )
+        candle = bars.iloc[-1]
         book = self._macro_book(now)
         profile = calculate_strike_gex(book.gex_fields, spot)
         macro_gex = calculate_total_net_gex(profile)
@@ -465,6 +478,11 @@ class ForwardTester:
             put_wall_2_gamma=_finite(intrad.put_wall_2_gamma) if put_wall_2 is not None else None,
             gex_0_1=gex_0_1,
             total_net_gex=gex_0_1 + float(macro_gex),
+            gex_volume=volume_gex(chain, spot),
+            bar_open=float(candle["Open"]),
+            bar_high=float(candle["High"]),
+            bar_low=float(candle["Low"]),
+            bar_close=float(candle["Close"]),
             zero_gamma=zero_gamma,
             cdf=_finite(intrad.cdf),
             atm_iv=_finite(intrad.atm_iv),
@@ -927,7 +945,8 @@ class ForwardTester:
                 "charm_guard", "entry_block_reason",
                 "call_wall_1_strike", "call_wall_1_gamma", "call_wall_2_strike", "call_wall_2_gamma",
                 "put_wall_1_strike", "put_wall_1_gamma", "put_wall_2_strike", "put_wall_2_gamma",
-                "gex_0_1", "total_net_gex",
+                "gex_0_1", "total_net_gex", "gex_volume",
+                "bar_open", "bar_high", "bar_low", "bar_close",
             ]
             self.db.execute(
                 "INSERT INTO snapshots (" + ", ".join(columns) + ") VALUES ("
@@ -967,6 +986,11 @@ class ForwardTester:
                     _db_float(snap.put_wall_2_gamma),
                     _db_float(snap.gex_0_1),
                     _db_float(snap.total_net_gex),
+                    _db_float(snap.gex_volume),
+                    _db_float(snap.bar_open),
+                    _db_float(snap.bar_high),
+                    _db_float(snap.bar_low),
+                    _db_float(snap.bar_close),
                 ],
             )
             for event in events:

@@ -29,7 +29,7 @@ PAGE = """<!DOCTYPE html>
   .stat { background: #181e25; border: 1px solid #2a3440; border-radius: 8px; padding: 8px 10px; }
   .stat b { display: block; font-size: 16px; font-weight: 600; }
   .stat span { color: #8ea0b0; font-size: 12px; }
-  .chart { height: 320px; margin-top: 4px; }
+  .chart { height: 640px; margin-top: 4px; }
   .chart.short { height: 200px; }
   .legend { color: #8ea0b0; font-size: 12px; margin-top: 4px; }
   .legend i { display: inline-block; width: 10px; height: 3px; margin: 0 4px 2px 10px; vertical-align: middle; }
@@ -45,9 +45,9 @@ PAGE = """<!DOCTYPE html>
   <p class="sub" id="status">Loading the latest snapshot…</p>
   <section class="stats" id="stats"></section>
   <h2>Spot, VWAP, bands, and 0DTE walls</h2>
-  <p class="sub">Dollars. Clock labels are Eastern. 1σ and 2σ are the expected move, spot × ATM IV × sqrt(1/252), centered on VWAP. A secondary wall is dashed, and only drawn when its dollar gamma is at least 80% of the primary.</p>
+  <p class="sub">Dollars. Clock labels are Eastern. Candles are the one-minute bar. 1σ and 2σ are the expected move still left in the session, spot × ATM IV × sqrt(minutes left / (390 × 252)), centered on VWAP. A secondary wall is dashed, and only drawn when its dollar gamma is at least 80% of the primary.</p>
   <div id="price" class="chart"></div>
-  <div class="legend"><i style="background:#d7e3ea"></i>Spot<i style="background:#8aa0b4"></i>VWAP<i style="background:#6d8eae"></i>1σ<i style="background:#9eb6c9"></i>2σ<i style="background:#e06c75"></i>Call wall<i style="background:#e06c75"></i>Call 2<i style="background:#7dcea0"></i>Put wall<i style="background:#7dcea0"></i>Put 2<i style="background:#e6c07b"></i>Zero gamma</div>
+  <div class="legend"><i style="background:#7dcea0"></i>Up<i style="background:#e06c75"></i>Down<i style="background:#8aa0b4"></i>VWAP<i style="background:#6d8eae"></i>1σ<i style="background:#9eb6c9"></i>2σ<i style="background:#e06c75"></i>Call wall<i style="background:#e06c75"></i>Call 2<i style="background:#7dcea0"></i>Put wall<i style="background:#7dcea0"></i>Put 2<i style="background:#e6c07b"></i>Zero gamma</div>
   <h2>Cumulative delta flow</h2>
   <p class="sub">Share-delta, in millions.</p>
   <div id="cdf" class="chart short"></div>
@@ -55,9 +55,9 @@ PAGE = """<!DOCTYPE html>
   <p class="sub">Percent.</p>
   <div id="iv" class="chart short"></div>
   <h2>Net GEX</h2>
-  <p class="sub">Gamma × open interest × 100 × spot. Total adds the 0–1 DTE book to the 30–90 DTE book. Friday’s file has the 30–90 book only.</p>
+  <p class="sub">Gamma × open interest × 100 × spot. Total adds the 0–1 DTE book to the 30–90 DTE book. Volume GEX uses session volume in place of open interest on the 0DTE book.</p>
   <div id="gex" class="chart short"></div>
-  <div class="legend"><i style="background:#d7e3ea"></i>Total<i style="background:#6cb6ff"></i>0–1 DTE<i style="background:#e6c07b"></i>30–90 DTE</div>
+  <div class="legend"><i style="background:#d7e3ea"></i>Total<i style="background:#6cb6ff"></i>0–1 DTE<i style="background:#c084fc"></i>Volume<i style="background:#e6c07b"></i>30–90 DTE</div>
   <h2>Paper balances</h2>
   <p class="sub">Realized profit versus each balance at the session open. The line steps when a position closes. A flat line at zero means no fills.</p>
   <div id="pnl" class="chart short"></div>
@@ -134,6 +134,30 @@ function series(bundle, name, options) {
   if (!bundle.series[name]) bundle.series[name] = bundle.chart.addLineSeries(options);
   return bundle.series[name];
 }
+function candleSeries(bundle) {
+  if (!bundle.series.candle) {
+    bundle.series.candle = bundle.chart.addCandlestickSeries({
+      upColor: "#7dcea0",
+      downColor: "#e06c75",
+      borderUpColor: "#7dcea0",
+      borderDownColor: "#e06c75",
+      wickUpColor: "#7dcea0",
+      wickDownColor: "#e06c75",
+      priceLineVisible: false,
+    });
+  }
+  return bundle.series.candle;
+}
+function candleData(rows) {
+  return rows.map((row) => {
+    const open = row.open != null ? row.open : row.spot;
+    if (open == null) return { time: row.time };
+    const high = row.high != null ? row.high : open;
+    const low = row.low != null ? row.low : open;
+    const close = row.close != null ? row.close : open;
+    return { time: row.time, open: open, high: high, low: low, close: close };
+  });
+}
 function setLine(bundle, name, options, rows, key) {
   const points = lineData(rows, key);
   if (!points.some((point) => point.value != null)) return;
@@ -145,7 +169,7 @@ function render(data) {
     ? new Intl.DateTimeFormat("en-US", { ...ET, month: "short", day: "numeric", second: "2-digit" }).format(new Date(data.updated))
     : "no snapshot yet";
   document.getElementById("status").textContent = data.session_date
-    ? "Session " + data.session_date + " · last write " + when + " ET · refreshes every 15 seconds"
+    ? "Session " + data.session_date + " · last write " + when + " ET · refreshes every minute"
     : "Waiting for the forward tester to publish a snapshot.";
   const balances = data.balances || {};
   const cells = [
@@ -157,6 +181,8 @@ function render(data) {
     ["Put wall 2", num(latest.put_wall_2, 2)],
     ["0–1 DTE GEX", gexText(latest.gex_0_1)],
     ["Total net GEX", gexText(latest.total_net_gex)],
+    ["Volume GEX", gexText(latest.gex_volume)],
+    ["1% hedge", gexText(latest.hedge_1pct)],
     ["30–90 DTE GEX", gexText(latest.macro_gex)],
     ["Zero gamma", num(latest.zero_gamma, 2)],
     ["2σ high", num(latest.upper_2, 2)],
@@ -174,7 +200,7 @@ function render(data) {
   ).join("");
 
   const price = ensureChart("price", chartOptions());
-  series(price, "spot", { color: "#d7e3ea", lineWidth: 2, title: "Spot", priceLineVisible: false }).setData(lineData(data.price || [], "spot"));
+  candleSeries(price).setData(candleData(data.price || []));
   series(price, "vwap", { color: "#8aa0b4", lineWidth: 1, title: "VWAP", priceLineVisible: false }).setData(lineData(data.price || [], "vwap"));
   const quiet = { lineWidth: 1, priceLineVisible: false, lastValueVisible: false, title: "" };
   series(price, "u1", { ...quiet, color: "#6d8eae", lineStyle: LightweightCharts.LineStyle.Dotted }).setData(lineData(data.price || [], "upper_1"));
@@ -193,10 +219,10 @@ function render(data) {
     shape: trade.event === "OPEN" ? "arrowUp" : "arrowDown",
     text: trade.strategy + " " + trade.event,
   }));
-  price.series.spot.setMarkers(markers);
+  price.series.candle.setMarkers(markers);
   const scaleValues = [];
   for (const row of data.price || []) {
-    for (const key of ["spot", "upper_2", "lower_2"]) {
+    for (const key of ["high", "low", "spot", "upper_2", "lower_2"]) {
       if (row[key] != null) scaleValues.push(row[key]);
     }
   }
@@ -205,7 +231,7 @@ function render(data) {
     const high = Math.max(...scaleValues);
     const pad = 0.15;
     const provider = () => ({ priceRange: { minValue: low - pad, maxValue: high + pad } });
-    for (const name of ["spot", "vwap", "u1", "l1", "u2", "l2", "call", "call2", "put", "put2", "zero"]) {
+    for (const name of ["candle", "vwap", "u1", "l1", "u2", "l2", "call", "call2", "put", "put2", "zero"]) {
       if (price.series[name]) price.series[name].applyOptions({ autoscaleInfoProvider: provider });
     }
   }
@@ -218,6 +244,7 @@ function render(data) {
   const gex = ensureChart("gex", chartOptions(gexText));
   setLine(gex, "total", { color: "#d7e3ea", lineWidth: 2, title: "Total", priceLineVisible: false }, data.gex || [], "total");
   setLine(gex, "near", { color: "#6cb6ff", lineWidth: 2, title: "0–1 DTE", priceLineVisible: false }, data.gex || [], "near");
+  setLine(gex, "volume", { color: "#c084fc", lineWidth: 2, title: "Volume", priceLineVisible: false }, data.gex || [], "volume");
   setLine(gex, "macro", { color: "#e6c07b", lineWidth: 2, title: "30–90 DTE", priceLineVisible: false }, data.gex || [], "macro");
   gex.chart.timeScale().fitContent();
 
@@ -260,7 +287,7 @@ async function refresh() {
   }
 }
 refresh();
-setInterval(refresh, 15000);
+setInterval(refresh, 60000);
 </script>
 </body>
 </html>

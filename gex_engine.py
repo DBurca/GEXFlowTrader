@@ -216,6 +216,22 @@ def net_gex(chain: pd.DataFrame, spot: float) -> float:
     return float(np.sum(calls - puts))
 
 
+def volume_gex(chain: pd.DataFrame, spot: float) -> float:
+    """0DTE gamma × session volume × 100 × spot, calls minus puts."""
+    if chain.empty:
+        return 0.0
+    calls = oi_dollar_gamma(chain["call_gamma"], chain["call_volume"], spot)
+    puts = oi_dollar_gamma(chain["put_gamma"], chain["put_volume"], spot)
+    return float(np.sum(calls - puts))
+
+
+def normalized_gex(net: float, spot: float) -> float:
+    """Dollars of underlying to buy or sell for a 1% move: net GEX × 0.01 × spot."""
+    if not np.isfinite(net) or not np.isfinite(spot):
+        return float("nan")
+    return float(net) * 0.01 * float(spot)
+
+
 def rank_gamma_walls(
     strikes: Any,
     exposure: Any,
