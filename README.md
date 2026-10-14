@@ -53,7 +53,7 @@ sequenceDiagram
 
   Clock->>Tester: session open
   loop every 60 seconds
-    Tester->>Schwab: spot, 1-minute bars, 0DTE chain, 0-1 DTE GEX
+    Tester->>Schwab: spot, SPY and /ES 1-minute bars, 0DTE chain, 0-1 DTE GEX
     Tester->>Schwab: 30-90 DTE book, every 15 minutes
     Tester->>Tester: levels, bands, signals, paper marks
     Tester->>DuckDB: commit snapshot, trades, balances
@@ -77,7 +77,8 @@ DuckDB allows one writer. A second connection to the live file fails, which is w
 
 | Book | When | What it feeds |
 | --- | --- | --- |
-| Spot and 1-minute bars | Every poll | VWAP, 5-minute bars, HMM, OU |
+| SPY spot and 1-minute bars | Every poll | VWAP, 5-minute and 15-minute bars, HMM, OU |
+| /ES 1-minute bars | Every poll | Momentum price, session VWAP, and 15-minute slope. SPY closes stand in when /ES is empty |
 | 0DTE chain, 30 strikes | Every poll | Walls, zero gamma, CDF, ATM IV, intraday structures |
 | 0DTE and 1DTE chain | Every poll | `gex_0_1` magnitude |
 | 30–90 DTE chain, 50 strikes | Every 15 minutes, or every poll while a macro position is open | Macro GEX, gamma flip, the macro put spread |
@@ -114,12 +115,13 @@ Dollar Gamma = Gamma × Open Interest × 100 × Spot
 
 A wall or zero-gamma print that jumps more than one SPY strike ($1.01) is held until the new level repeats for three polls. A one-strike step is accepted immediately. A secondary wall has to confirm for three polls before it appears, and it clears only after three polls of absence.
 
-**Expected move** still left in the session, centered on VWAP. A full 390-minute day matches `spot × ATM IV × sqrt(1/252)`.
+**Expected move** still left in the session, centered on VWAP. A full 390-minute day matches `spot × ATM IV × sqrt(1/252)`. The upper width uses ATM call IV and the lower width uses ATM put IV. A missing side falls back to the combined ATM average.
 
 ```text
-width = Spot × ATM IV × sqrt(minutes left / (390 × 252))
-1σ    = VWAP ± width
-2σ    = VWAP ± 2 × width
+width = Spot × side IV × sqrt(minutes left / (390 × 252))
+upper 1σ = VWAP + call width
+lower 1σ = VWAP − put width
+2σ       = twice that width on the same side
 ```
 
 Absorption and cascade use these bands, so a 1σ test and a 2σ target tighten as the close approaches.
@@ -130,7 +132,15 @@ Absorption and cascade use these bands, so a 1σ test and a 2σ target tighten a
 
 **Charm to close** is the dollars of underlying the same signed book must trade by the cash close as delta decays. Charm is Black-Scholes `dDelta` per year of time passing, times the minutes still left, times 100, times spot. Calls minus puts. A positive figure means delta rises into the close, so the hedge sells shares. It is a published stat. The last-hour entry block is still the max-open-interest pin, not this greek.
 
-ATM IV is the average of the call and put implied vol at the strike nearest spot.
+ATM IV is the average of the call and put implied vol at the strike nearest spot. `atm_call_iv` and `atm_put_iv` are stored separately and drive the upper and lower bands.
+
+**Overnight PML** is the 0DTE strike where long-option dealer liability is largest: call open interest × call gamma, plus put open interest × put gamma. At the 09:30 ET poll the tester freezes that strike with the primary call wall and primary put wall. The three values live in `SESSION_STATE` (`static_open_call_wall_1`, `static_open_put_wall_1`, `static_open_pml`, plus `static_open_day`) and stay fixed for the session. A restart reloads them. A poll after 09:30 does not invent them from a later chain.
+
+**IV peak center** is the geometric center of the contiguous 0DTE strikes whose average call/put IV is at least 98% of the highest strike IV.
+
+**IV max fear** is the first strike beyond the outer call wall, and beyond the outer put wall, where that side's dollar gamma is under 20% of the primary wall. The outer wall is the farther of the primary and the 80% secondary.
+
+**ES momentum** is the last /ES price, /ES session VWAP, and the regression slope of the last 15 one-minute closes, in percent of the last price. When /ES bars are missing, the same three numbers are computed on SPY.
 
 **CDF** is share-delta flow on the 0DTE book:
 
@@ -164,18 +174,18 @@ flowchart TD
   brk -->|yes| debit["0DTE debit spread"]
   brk -->|no| skip
 
-  settle["Last 5 minutes of the session"] --> macro{"Spot under the macro flip, book transitioning, HMM 0 to 1 or OU faded"}
+  window["11:00 to 15:55 ET"] --> macro{"Two 15-minute closes under the flip, macro GEX negative, HMM state 1 or OU faded"}
   macro -->|yes| swing["30 to 60 DTE put debit"]
 ```
 
 | | Absorption | Cascade | Macro swing |
 | --- | --- | --- | --- |
-| Regime | Intraday GEX > 0, macro GEX ≥ 0, HMM state 0 | Intraday GEX < 0, and macro GEX < 0 or spot below the flip | Spot below the macro flip, and the book is negative or the prior close was above the flip |
-| Extra | ATM IV within 0.002 of the 15-minute reading. CDF moves with the fade, or is flat | IV up 0.005 or 3% versus 15 minutes ago. 15-minute CDF change larger than the prior 15 minutes, and in the trade direction | HMM shifted 0 → 1, or OU theta ≤ 0.005. Checked once in the closing 5 minutes |
-| Trigger | 5-minute test of the put wall, call wall, 1σ, or 2σ that fails to close through. A wall wins when both a wall and a band qualify | 5-minute close through `call_wall_2` on the upside, or `put_wall_2` on the downside, when that secondary wall exists. Otherwise the primary wall or zero gamma. Price must be on the correct side of VWAP | Same-day check during the closing 5 minutes |
-| Structure | 0DTE credit, short strike at the tested level, long strike one strike further out | 0DTE debit, about $2 wide, long strike nearest spot | 30–60 DTE put debit, about $5 wide, expiration nearest 45 DTE |
-| Stop | Close back through the tested level, with CDF confirming. A 1σ fade uses the secondary wall as that level when the secondary exists | Close back through zero gamma | Next session: HMM back in state 0. Or, in the closing 5 minutes, spot back above the flip or macro GEX ≥ 0 |
-| Take profit | Half the credit, or spot back to VWAP or zero gamma. Taken only when the close is green after fees | Spot reaches the 2σ band in the trade direction, or CDF stays flat for three polls. Taken only when the close is green after fees | The exit rules above |
+| Regime | Intraday GEX > 0, macro GEX ≥ 0, HMM state 0 | Intraday GEX < 0, and macro GEX < 0 or spot below the flip | Macro GEX < 0, from 11:00 through 15:55 ET |
+| Extra | ATM IV within 0.002 of the 15-minute reading. CDF moves with the fade, or is flat. A bullish fade is blocked when the 15-minute slope is below −0.05%. A bearish fade is blocked when it is above +0.05% | IV up 0.005 or 3% versus 15 minutes ago. 15-minute CDF change larger than the prior 15 minutes, and in the trade direction. /ES last price must be on the breakout side of /ES VWAP, and the slope must share that sign | Two completed 15-minute SPY closes below the macro flip. HMM state 1, or OU theta ≤ 0.005 |
+| Trigger | 5-minute test of the put wall, call wall, 1σ, or 2σ that fails to close through. A wall wins when both a wall and a band qualify | 5-minute close through `call_wall_2` on the upside, or `put_wall_2` on the downside, when that secondary wall exists. Otherwise the primary wall or zero gamma. Price must be on the correct side of SPY VWAP | The window, the two closes, and the regime above. A same-day exit does not re-enter |
+| Structure | 0DTE credit, short strike at the tested level, long strike one strike further out | 0DTE debit, about $2 wide, long strike nearest spot | 30–60 DTE put debit, about $5 wide, expiration nearest 45 DTE. Reason starts with `ENTER_MACRO_PUT_DEBIT` |
+| Stop | 5-minute close through the structural stop, with CDF confirming. An upper fade (call wall or upper 1σ) stops above `iv_max_fear_upper`. A lower fade (put wall or lower 1σ) stops below `iv_max_fear_lower`. When that fear strike is missing, a 1σ fade still uses the secondary wall | Close back through zero gamma | Next session: HMM back in state 0. Or, in the closing 5 minutes, spot back above the flip or macro GEX ≥ 0 |
+| Take profit | Half the credit, spot back to VWAP or zero gamma, or spot touching the IV peak center. Taken only when the close is green after fees | Spot reaches the 2σ band in the trade direction, or CDF stays flat for three polls. Taken only when the close is green after fees | The exit rules above |
 | Flatten | Last 5 minutes | Last 5 minutes | Held overnight |
 
 A quote is skipped when the combined bid-ask width is more than `SPREAD_BA_MAX_RATIO` (default 5%) of the structure's mid value, when the premium is under $0.05, or when the credit or debit is wider than the strikes. The charm guard blocks new entries in the last hour when spot is within 0.15% of the 0DTE strike with the most open interest.
@@ -190,8 +200,9 @@ A take-profit event is written only when the marked close is positive after fees
 | Risk | 2% of that strategy's balance |
 | Size | Whole contracts, max loss inside the risk budget, cap 25 |
 | Fees | $0.65 × contracts × legs × 2 |
-| Mark | Mid of each leg. A stop or flatten may fall back to intrinsic when quotes are missing |
-| PnL | `(entry net − current net) × 100 × contracts − fees`. Net is short mid minus long mid, so a credit is positive |
+| Mark | Signed mid minus `SLIPPAGE_SPREAD_FACTOR` × the summed bid-ask width on the way in, and plus that amount on the way out. Default factor is 0.35. A stop or flatten may fall back to intrinsic when quotes are missing |
+| Reject | A debit whose fill is at least as wide as the strikes, or a credit fill of $0.05 or less, is not opened |
+| PnL | `(entry fill − closing fill) × 100 × contracts − fees`. The signed mid is short mid minus long mid, so a credit is positive. `TRADES` stores `mid_price` and `executed_fill_price` |
 
 ## Storage
 
@@ -220,6 +231,8 @@ erDiagram
     string strategy
     string event
     float pnl
+    float mid_price
+    float executed_fill_price
     string detail
   }
   BALANCES {
@@ -236,7 +249,9 @@ erDiagram
   }
 ```
 
-`live_view.json` is replaced atomically beside the database. It holds the latest session only: price levels, CDF, ATM IV, the three GEX series, balances, open positions, and trades. A gap longer than three minutes is a break in the line. The publisher recomputes the expected-move bands from stored spot, VWAP, and ATM IV, and it replays the wall filter, so a chart rebuilt from an older file still uses the current level rules.
+`SESSION_STATE` also holds `static_open_day`, `static_open_call_wall_1`, `static_open_put_wall_1`, and `static_open_pml` for the session that locked them.
+
+`live_view.json` is replaced atomically beside the database. It holds the latest session only: price levels, the three static opening levels, CDF, ATM IV, the GEX series, balances, open positions, and trades. A gap longer than three minutes is a break in the line. The publisher recomputes the expected-move bands from stored spot, VWAP, ATM IV, and the call and put IVs when those columns exist, and it replays the wall filter, so a chart rebuilt from an older file still uses the current level rules. The static lines are published only when `static_open_day` matches the session.
 
 ## Chart
 
@@ -252,11 +267,14 @@ erDiagram
 | Put wall 1 | Solid green |
 | Put wall 2 | Dashed green, omitted when null |
 | Zero gamma | Solid gold |
+| Open call wall | Dotted red, the 09:30 primary call wall |
+| Open put wall | Dotted green, the 09:30 primary put wall |
+| Open PML | Dotted gray, the 09:30 peak-liability strike |
 | Net GEX | Total, 0–1 DTE, 0DTE volume, and 30–90 DTE |
 | Price | One-minute candles, VWAP, remaining-session 1σ, walls |
 | PnL | Change from each balance at the session open |
 
-Clock labels are America/New_York. The price scale follows spot and the 1σ bands so a wall outside that range does not flatten the session. The 2σ levels stay in the signal logic: absorption can still fade a failed 2σ test, and cascade still takes profit when spot reaches 2σ. They are not drawn.
+Clock labels are America/New_York. The price scale follows spot, the 1σ bands, and the opening reference lines. The 2σ levels stay in the signal logic: absorption can still fade a failed 2σ test, and cascade still takes profit when spot reaches 2σ. They are not drawn.
 
 ## Layout
 
@@ -267,7 +285,7 @@ Clock labels are America/New_York. The price scale follows spot and the 1σ band
 | `live_signals.py` | Entry rules, structures, HMM, OU, slippage, fees |
 | `live_view.py` | JSON publisher |
 | `live_dashboard.py` | Read-only chart server |
-| `gex_engine.py` | Strike GEX, dollar gamma, walls, CDF, ATM IV, level filter |
+| `gex_engine.py` | Strike GEX, dollar gamma, walls, PML, IV peak, max fear, CDF, ATM IV, level filter |
 | `ta_engine.py` | VWAP and expected-move bands |
 | `signal_engine.py` | Macro gamma flip |
 | `event_calendar.py` | NYSE hours, holidays, CPI / NFP / FOMC blackouts |
@@ -294,6 +312,7 @@ SCHWAB_REFRESH_TOKEN_PATH=/data/schwab_refresh_token
 DISCORD_WEBHOOK_URL
 DUCKDB_PATH=/data/forward_test.db
 SPREAD_BA_MAX_RATIO=0.05
+SLIPPAGE_SPREAD_FACTOR=0.35
 INITIAL_BALANCE=100000
 ```
 

@@ -30,7 +30,10 @@ from live_signals import (
     minutes_before_close,
     ornstein_uhlenbeck,
     reverted_to_mean,
+    touched_iv_peak,
     round_trip_fees,
+    executed_fill,
+    fill_price_blocks,
     slippage_blocks,
     structure_nets,
     trade_pnl,
@@ -147,24 +150,40 @@ def test_absorption_and_cascade() -> None:
 
 
 def test_macro_signal_and_exits() -> None:
+    noon = datetime(2026, 10, 8, 12, 0, tzinfo=EASTERN)
     signal = macro_swing_signal(
-        spot=500,
-        previous_close=510,
+        now=noon,
         macro_gex=-1,
         gamma_flip=505,
         hmm_state=1,
-        previous_hmm=0,
         ou_theta=0.2,
+        fifteen_closes=[500, 502],
     )
     assert signal is not None and signal.structure == "put_debit_macro"
+    assert "ENTER_MACRO_PUT_DEBIT" in signal.reason
     assert macro_swing_signal(
-        spot=510,
-        previous_close=500,
+        now=noon,
         macro_gex=-1,
         gamma_flip=505,
         hmm_state=1,
-        previous_hmm=0,
         ou_theta=0.0,
+        fifteen_closes=[510, 508],
+    ) is None
+    assert macro_swing_signal(
+        now=datetime(2026, 10, 8, 10, 30, tzinfo=EASTERN),
+        macro_gex=-1,
+        gamma_flip=505,
+        hmm_state=1,
+        ou_theta=0.2,
+        fifteen_closes=[500, 500],
+    ) is None
+    assert macro_swing_signal(
+        now=noon,
+        macro_gex=1,
+        gamma_flip=505,
+        hmm_state=1,
+        ou_theta=0.0,
+        fifteen_closes=[500, 500],
     ) is None
     assert breach_confirmed("bullish", 549, 550, 1, 5)
     assert not breach_confirmed("bullish", 549, 550, 6, 5)
@@ -221,6 +240,13 @@ def test_structures_slippage_and_pnl() -> None:
     pnl = trade_pnl(debit_net, debit_net - 0.50, 2, round_trip_fees(2, 2))
     assert abs(pnl - (100.0 - 5.20)) < 1e-9
     assert contract_count(100_000, 5_000) == 0
+    credit_fill = executed_fill(0.80, 0.04, 0.35)
+    assert abs(credit_fill - (0.80 - 0.35 * 0.04)) < 1e-9
+    assert fill_price_blocks(0.80, credit_fill, legs) is None
+    assert fill_price_blocks(0.80, 0.05, legs) == "credit fill is at or below 0.05"
+    debit_fill = executed_fill(-1.20, 0.08, 0.35)
+    assert debit_fill < -1.20
+    assert fill_price_blocks(-1.20, -2.0, debit) == "debit fill is at least the strike width"
 
 
 def test_charm_and_five_minute_clock() -> None:
@@ -298,6 +324,8 @@ def _snapshot() -> "MarketSnapshot":
         zero_gamma=500,
         cdf=10,
         atm_iv=0.15,
+        atm_call_iv=0.16,
+        atm_put_iv=0.14,
         vwap=500,
         upper_1=505,
         lower_1=495,
@@ -319,6 +347,16 @@ def _snapshot() -> "MarketSnapshot":
         macro_expiration=None,
         macro_dte=None,
         bars_5=pd.DataFrame(),
+        minute_bars=pd.DataFrame(),
+        momentum_price=500.0,
+        momentum_vwap=500.0,
+        momentum_slope=0.0,
+        iv_peak_center=None,
+        iv_max_fear_upper=None,
+        iv_max_fear_lower=None,
+        static_open_call_wall_1=None,
+        static_open_put_wall_1=None,
+        static_open_pml=None,
     )
 
 
@@ -464,7 +502,7 @@ def test_walls_expected_move_and_secondary_rules() -> None:
     from datetime import datetime, time
 
     from gex_engine import net_gex, normalized_gex, rank_gamma_walls, volume_gex
-    from ta_engine import expected_move, minutes_remaining
+    from ta_engine import expected_move, expected_move_bands, minutes_remaining
 
     strikes = [100, 101, 102]
     exposure = [10, 9, 5]
@@ -488,6 +526,10 @@ def test_walls_expected_move_and_secondary_rules() -> None:
     assert abs(move - full_day) < 1e-9
     assert abs(expected_move(500, 0.16, 195) - full_day * (0.5 ** 0.5)) < 1e-9
     assert expected_move(500, 0.16, 0) == 0
+    upper_1, lower_1, upper_2, lower_2 = expected_move_bands(100, 100, 0.10, 390, call_iv=0.20, put_iv=0.10)
+    assert abs((upper_1 - 100) - 2.0 * (100 - lower_1)) < 1e-9
+    assert abs((upper_2 - 100) - 2.0 * (upper_1 - 100)) < 1e-9
+    assert abs((100 - lower_2) - 2.0 * (100 - lower_1)) < 1e-9
     assert minutes_remaining(datetime(2026, 10, 12, 15, 0), time(16, 0)) == 60
     volume_chain = chain.copy()
     volume_chain["call_volume"] = [100, 50]
@@ -612,6 +654,41 @@ def test_charm_and_iv_zero_gamma() -> None:
     assert charm_to_close(chain(0.2), 100.0, as_of, 0) == 0
 
 
+def test_momentum_and_skew_guards() -> None:
+    from gex_engine import momentum_features
+
+    index = pd.date_range("2026-10-08 10:00", periods=15, freq="1min", tz=EASTERN)
+    rising = pd.DataFrame(
+        {"Open": 100, "High": 101, "Low": 99, "Close": [100 + i / 14 for i in range(15)], "Volume": 1},
+        index=index,
+    )
+    price, _vwap, slope = momentum_features(rising)
+    assert price == 101
+    assert slope > 0.05
+    falling = rising.copy()
+    falling["Close"] = [101 - i / 14 for i in range(15)]
+    assert momentum_features(falling)[2] < -0.05
+
+    blocked = absorption_signal(
+        _bar(100, 101, 98, 99.5),
+        intrad_gex=1,
+        macro_gex=1,
+        hmm_state=0,
+        call_wall=110,
+        put_wall=100,
+        upper_2=120,
+        lower_2=80,
+        upper_1=105,
+        lower_1=99,
+        cdf_now=5,
+        cdf_prev=4,
+        iv_now=0.1,
+        iv_prev=0.1,
+        momentum_slope=-0.06,
+    )
+    assert blocked is None
+
+
 def test_cdf_flat_needs_three_polls() -> None:
     from live_signals import next_cdf_flat_streak
 
@@ -652,6 +729,103 @@ def test_level_spikes_are_held() -> None:
     assert cleaned == [777.25, 777.25, 777.25, 777.25, 777.31]
 
 
+def test_open_levels_peak_and_fear() -> None:
+    from gex_engine import iv_max_fear_levels, iv_peak_center, overnight_pml
+
+    chain = pd.DataFrame({
+        "strikePrice": [96, 98, 100, 101, 102, 104],
+        "call_gamma": [0.0, 0.0, 0.01, 0.02, 0.08, 0.001],
+        "put_gamma": [0.001, 0.05, 0.01, 0.0, 0.0, 0.0],
+        "call_openInterest": [10, 10, 10, 10, 100, 100],
+        "put_openInterest": [100, 100, 10, 10, 10, 10],
+        "call_volatility": [0.10, 0.12, 0.20, 0.20, 0.11, 0.10],
+        "put_volatility": [0.10, 0.12, 0.20, 0.20, 0.11, 0.10],
+    })
+    # Call liability peaks at 102 (0.05 × 100). Put liability peaks at 98.
+    # Combined liability is largest at 102.
+    assert overnight_pml(chain) == 102
+    center = math.exp((math.log(100) + math.log(101)) / 2)
+    assert iv_peak_center(chain) is not None
+    assert abs(iv_peak_center(chain) - center) < 1e-9
+    fear_upper, fear_lower = iv_max_fear_levels(chain, 100)
+    assert fear_upper == 104
+    assert fear_lower == 96
+
+    bullish = absorption_signal(
+        _bar(100, 101, 98, 99.5),
+        intrad_gex=1,
+        macro_gex=1,
+        hmm_state=0,
+        call_wall=110,
+        put_wall=100,
+        upper_2=120,
+        lower_2=80,
+        upper_1=105,
+        lower_1=99,
+        call_wall_2=112,
+        put_wall_2=97,
+        cdf_now=5,
+        cdf_prev=4,
+        iv_now=0.1,
+        iv_prev=0.1,
+        iv_max_fear_lower=96,
+    )
+    assert bullish is not None and bullish.stop == 96
+    bearish = absorption_signal(
+        _bar(100, 111, 99, 109),
+        intrad_gex=1,
+        macro_gex=1,
+        hmm_state=0,
+        call_wall=110,
+        put_wall=90,
+        upper_2=120,
+        lower_2=80,
+        upper_1=115,
+        lower_1=85,
+        cdf_now=4,
+        cdf_prev=5,
+        iv_now=0.1,
+        iv_prev=0.1,
+        iv_max_fear_upper=114,
+    )
+    assert bearish is not None and bearish.stop == 114
+    assert touched_iv_peak("bullish", 101.2, 99, 101)
+    assert touched_iv_peak("bearish", 99.5, 102, 100)
+    assert not touched_iv_peak("bullish", 100, 101, 99)
+
+    os.environ.setdefault("SCHWAB_APP_KEY", "test-key")
+    os.environ.setdefault("SCHWAB_APP_SECRET", "test-secret")
+    os.environ.setdefault("SCHWAB_REFRESH_TOKEN", "test-token")
+    os.environ["DISCORD_WEBHOOK_URL"] = ""
+    with tempfile.TemporaryDirectory() as folder:
+        os.environ["DUCKDB_PATH"] = os.path.join(folder, "forward_test.db")
+        from live_forward import ForwardTester
+
+        bot = ForwardTester()
+        opening = datetime(2026, 10, 14, 9, 30, tzinfo=EASTERN)
+        bot._lock_open_levels(opening, 510.0, 490.0, chain)
+        assert bot.static_open_call_wall == 510
+        assert bot.static_open_put_wall == 490
+        assert bot.static_open_pml == 102
+        bot._lock_open_levels(opening.replace(hour=10), 520.0, 480.0, chain)
+        assert bot.static_open_call_wall == 510
+        bot._persist(_snapshot(), [])
+        saved = {
+            str(key): str(value)
+            for key, value in bot.db.execute("SELECT key, value FROM session_state").fetchall()
+        }
+        assert saved["static_open_day"] == "2026-10-14"
+        assert saved["static_open_call_wall_1"] == "510.0"
+        assert saved["static_open_put_wall_1"] == "490.0"
+        assert saved["static_open_pml"] == "102.0"
+        bot.shutdown()
+        reloaded = ForwardTester()
+        assert reloaded.static_open_call_wall == 510
+        assert reloaded.static_open_put_wall == 490
+        assert reloaded.static_open_pml == 102
+        reloaded.shutdown()
+
+
 if __name__ == "__main__":
     test_calendar()
     test_absorption_and_cascade()
@@ -665,4 +839,6 @@ if __name__ == "__main__":
     test_walls_expected_move_and_secondary_rules()
     test_charm_and_iv_zero_gamma()
     test_cdf_flat_needs_three_polls()
+    test_momentum_and_skew_guards()
+    test_open_levels_peak_and_fear()
     print("forward logic checks passed")

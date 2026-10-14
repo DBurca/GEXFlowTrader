@@ -113,6 +113,8 @@ class IntradayGEXSnapshot:
     cdf: float
     atm_iv: float
     charm_hedge: float
+    atm_call_iv: float
+    atm_put_iv: float
 
 
 def _as_eastern(moment: datetime | pd.Timestamp) -> pd.Timestamp:
@@ -228,6 +230,112 @@ def volume_gex(chain: pd.DataFrame, spot: float) -> float:
     calls = oi_dollar_gamma(chain["call_gamma"], chain["call_volume"], spot)
     puts = oi_dollar_gamma(chain["put_gamma"], chain["put_volume"], spot)
     return float(np.sum(calls - puts))
+
+
+def overnight_pml(chain: pd.DataFrame) -> float | None:
+    """Strike with the largest long-option dealer liability on the opening 0DTE book.
+
+    Dealers short the customer inventory, so liability at a strike is call
+    open interest × call gamma plus put open interest × put gamma. Spot and
+    the contract multiplier are the same at every strike and do not move the peak.
+    """
+    if chain.empty or "strikePrice" not in chain.columns:
+        return None
+    strikes = chain["strikePrice"].to_numpy(dtype=float)
+    call_oi = _finite(chain["call_openInterest"]) if "call_openInterest" in chain.columns else np.zeros(strikes.shape)
+    put_oi = _finite(chain["put_openInterest"]) if "put_openInterest" in chain.columns else np.zeros(strikes.shape)
+    call_gamma = _finite(chain["call_gamma"]) if "call_gamma" in chain.columns else np.zeros(strikes.shape)
+    put_gamma = _finite(chain["put_gamma"]) if "put_gamma" in chain.columns else np.zeros(strikes.shape)
+    finite = np.isfinite(strikes)
+    strikes = strikes[finite]
+    liability = (call_oi * call_gamma + put_oi * put_gamma)[finite]
+    if strikes.size == 0 or not np.isfinite(liability).any() or float(np.nanmax(liability)) <= 0:
+        return None
+    return float(strikes[int(np.nanargmax(liability))])
+
+
+# A strike stays in the IV peak when it is this close to the highest strike IV.
+PEAK_IV_RATIO = 0.98
+# Exposure has dropped off once dollar gamma is under this fraction of the primary wall.
+FEAR_GAMMA_RATIO = 0.20
+
+
+def _strike_iv(chain: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    frame = chain.sort_values("strikePrice")
+    strikes = frame["strikePrice"].to_numpy(dtype=float)
+    call_iv = frame["call_volatility"].to_numpy(dtype=float) if "call_volatility" in frame.columns else np.full(strikes.shape, np.nan)
+    put_iv = frame["put_volatility"].to_numpy(dtype=float) if "put_volatility" in frame.columns else np.full(strikes.shape, np.nan)
+    stacked = np.vstack([call_iv, put_iv])
+    with np.errstate(all="ignore"):
+        iv = np.nanmean(stacked, axis=0)
+    return strikes, iv
+
+
+def iv_peak_center(chain: pd.DataFrame) -> float | None:
+    """Geometric center of the contiguous 0DTE strikes that hold the IV peak."""
+    if chain.empty:
+        return None
+    strikes, iv = _strike_iv(chain)
+    finite = np.isfinite(strikes) & np.isfinite(iv) & (strikes > 0) & (iv > 0)
+    if not finite.any():
+        return None
+    strikes, iv = strikes[finite], iv[finite]
+    order = np.argsort(strikes)
+    strikes, iv = strikes[order], iv[order]
+    peak = float(np.max(iv))
+    zone = iv >= peak * PEAK_IV_RATIO
+    center_at = int(np.argmax(iv))
+    left = center_at
+    while left > 0 and zone[left - 1]:
+        left -= 1
+    right = center_at
+    while right + 1 < zone.size and zone[right + 1]:
+        right += 1
+    cluster = strikes[left : right + 1]
+    return float(np.exp(np.mean(np.log(cluster))))
+
+
+def iv_max_fear_levels(chain: pd.DataFrame, spot: float) -> tuple[float | None, float | None]:
+    """Outer strikes beyond the call and put walls where dollar gamma falls below 20% of the primary.
+
+    Returns (iv_max_fear_upper, iv_max_fear_lower).
+    """
+    if chain.empty or not np.isfinite(spot) or spot <= 0:
+        return None, None
+    frame = chain.sort_values("strikePrice")
+    strikes = frame["strikePrice"].to_numpy(dtype=float)
+    call_g = oi_dollar_gamma(frame["call_gamma"], frame["call_openInterest"], float(spot))
+    put_g = oi_dollar_gamma(frame["put_gamma"], frame["put_openInterest"], float(spot))
+    call_1, call_1_g, call_2, _call_2_g = rank_gamma_walls(strikes, call_g)
+    put_1, put_1_g, put_2, _put_2_g = rank_gamma_walls(strikes, put_g)
+    upper_wall = max((level for level in (call_1, call_2) if level is not None), default=None)
+    lower_wall = min((level for level in (put_1, put_2) if level is not None), default=None)
+    upper = _fear_beyond(strikes, call_g, upper_wall, call_1_g, above=True)
+    lower = _fear_beyond(strikes, put_g, lower_wall, put_1_g, above=False)
+    return upper, lower
+
+
+def _fear_beyond(
+    strikes: np.ndarray,
+    exposure: np.ndarray,
+    wall: float | None,
+    primary: float | None,
+    above: bool,
+) -> float | None:
+    if wall is None or primary is None or not np.isfinite(primary) or primary <= 0:
+        return None
+    order = np.argsort(strikes)
+    strikes = strikes[order]
+    exposure = exposure[order]
+    threshold = FEAR_GAMMA_RATIO * float(primary)
+    if above:
+        beyond = np.flatnonzero(strikes > wall + 1e-6)
+    else:
+        beyond = np.flatnonzero(strikes < wall - 1e-6)[::-1]
+    for index in beyond:
+        if float(exposure[index]) < threshold:
+            return float(strikes[index])
+    return None
 
 
 def normalized_gex(net: float, spot: float) -> float:
@@ -567,6 +675,31 @@ def cumulative_delta_flow(
     return float(np.sum(calls) - np.sum(puts))
 
 
+def atm_implied_vols(
+    strikes: Any,
+    call_iv: Any,
+    put_iv: Any,
+    spot: float,
+) -> tuple[float, float, float]:
+    """Call IV, put IV, and their average at the strike nearest spot. Decimal, not percent."""
+    strike_array = np.asarray(strikes, dtype=float)
+    if strike_array.size == 0 or not np.isfinite(spot):
+        return float("nan"), float("nan"), float("nan")
+    index = int(np.nanargmin(np.abs(strike_array - spot)))
+
+    def _one(series: Any) -> float:
+        value = float(np.asarray(series, dtype=float)[index])
+        if np.isfinite(value) and value > 0:
+            return value
+        return float("nan")
+
+    call = _one(call_iv)
+    put = _one(put_iv)
+    readings = [value for value in (call, put) if np.isfinite(value)]
+    average = float(np.mean(readings)) if readings else float("nan")
+    return call, put, average
+
+
 def atm_implied_volatility(
     strikes: Any,
     call_iv: Any,
@@ -574,19 +707,35 @@ def atm_implied_volatility(
     spot: float,
 ) -> float:
     """Average implied vol of the call and put nearest to spot. Decimal, not percent."""
-    strike_array = np.asarray(strikes, dtype=float)
-    if strike_array.size == 0 or not np.isfinite(spot):
-        return float("nan")
+    return atm_implied_vols(strikes, call_iv, put_iv, spot)[2]
 
-    index = int(np.nanargmin(np.abs(strike_array - spot)))
-    readings: list[float] = []
-    for series in (call_iv, put_iv):
-        value = float(np.asarray(series, dtype=float)[index])
-        if np.isfinite(value) and value > 0:
-            readings.append(value)
-    if not readings:
-        return float("nan")
-    return float(np.mean(readings))
+
+def momentum_features(bars: pd.DataFrame) -> tuple[float, float, float]:
+    """Last price, session VWAP, and the fitted 15-minute move in percent.
+
+    The slope is a linear regression of the last 15 closes. The percent is
+    that slope across the window, divided by the last price.
+    """
+    if bars.empty or "Close" not in bars.columns:
+        return float("nan"), float("nan"), float("nan")
+    typical = (bars["High"] + bars["Low"] + bars["Close"]) / 3.0
+    volume = bars["Volume"].to_numpy(dtype=float)
+    typical_values = typical.to_numpy(dtype=float)
+    if np.nansum(volume) > 0:
+        vwap = float(np.nansum(typical_values * volume) / np.nansum(volume))
+    else:
+        vwap = float(np.nanmean(typical_values))
+    closes = bars["Close"].to_numpy(dtype=float)
+    closes = closes[np.isfinite(closes)]
+    if closes.size == 0:
+        return float("nan"), vwap, float("nan")
+    price = float(closes[-1])
+    window = closes[-15:]
+    if window.size < 2 or price <= 0:
+        return price, vwap, float("nan")
+    slope = float(np.polyfit(np.arange(window.size, dtype=float), window, 1)[0])
+    percent = slope * float(window.size - 1) / price * 100.0
+    return price, vwap, percent
 
 
 def build_intraday_snapshot(
@@ -603,6 +752,12 @@ def build_intraday_snapshot(
     put_exposure = oi_dollar_gamma(chain["put_gamma"], chain["put_openInterest"], float(spot))
     call_1, call_1_g, call_2, call_2_g = rank_gamma_walls(chain["strikePrice"], call_exposure)
     put_1, put_1_g, put_2, put_2_g = rank_gamma_walls(chain["strikePrice"], put_exposure)
+    call_iv, put_iv, average_iv = atm_implied_vols(
+        chain["strikePrice"],
+        chain["call_volatility"],
+        chain["put_volatility"],
+        float(spot),
+    )
     return IntradayGEXSnapshot(
         as_of=_as_eastern(as_of),
         spot=float(spot),
@@ -624,13 +779,10 @@ def build_intraday_snapshot(
             chain["put_volume"],
             chain["put_delta"],
         ),
-        atm_iv=atm_implied_volatility(
-            chain["strikePrice"],
-            chain["call_volatility"],
-            chain["put_volatility"],
-            float(spot),
-        ),
+        atm_iv=average_iv,
         charm_hedge=charm_to_close(chain, float(spot), as_of, minutes_left),
+        atm_call_iv=call_iv,
+        atm_put_iv=put_iv,
     )
 
 

@@ -37,6 +37,10 @@ from gex_engine import (
     calculate_strike_gex,
     calculate_total_net_gex,
     classify_regime,
+    iv_max_fear_levels,
+    iv_peak_center,
+    momentum_features,
+    overnight_pml,
     stabilize_level,
     stabilize_optional_level,
     volume_gex,
@@ -47,6 +51,7 @@ from live_market import (
     SchwabSession,
     fetch_intraday_chain,
     fetch_macro_book,
+    fetch_momentum_bars,
     fetch_near_term_gex,
     session_bars,
 )
@@ -70,12 +75,17 @@ from live_signals import (
     ornstein_uhlenbeck,
     pin_strike_from_chain,
     reverted_to_mean,
+    touched_iv_peak,
     round_trip_fees,
     slippage_blocks,
     structure_nets,
     trade_pnl,
+    completed_fifteen_minute_closes,
     completed_five_minute,
+    executed_fill,
+    fill_price_blocks,
     five_minute_bars,
+    macro_entry_window,
     value_at_or_before,
 )
 from live_view import publish_live_view
@@ -126,6 +136,8 @@ class MarketSnapshot:
     zero_gamma: float | None
     cdf: float | None
     atm_iv: float | None
+    atm_call_iv: float | None
+    atm_put_iv: float | None
     vwap: float
     upper_1: float
     lower_1: float
@@ -147,6 +159,16 @@ class MarketSnapshot:
     macro_expiration: str | None
     macro_dte: int | None
     bars_5: pd.DataFrame
+    minute_bars: pd.DataFrame
+    momentum_price: float | None
+    momentum_vwap: float | None
+    momentum_slope: float | None
+    iv_peak_center: float | None
+    iv_max_fear_upper: float | None
+    iv_max_fear_lower: float | None
+    static_open_call_wall_1: float | None
+    static_open_put_wall_1: float | None
+    static_open_pml: float | None
 
 
 class ForwardTester:
@@ -162,6 +184,7 @@ class ForwardTester:
             )
         self.initial = float(os.environ.get("INITIAL_BALANCE", "100000"))
         self.max_ba_ratio = float(os.environ.get("SPREAD_BA_MAX_RATIO", "0.05"))
+        self.slippage_factor = float(os.environ.get("SLIPPAGE_SPREAD_FACTOR", "0.35"))
         self.webhook = os.environ.get("DISCORD_WEBHOOK_URL", "")
         self.db = duckdb.connect(os.environ.get("DUCKDB_PATH", "forward_test.db"))
         self.client = SchwabSession(
@@ -194,6 +217,11 @@ class ForwardTester:
         self._put_wall_2_state = LevelState()
         self._zero_gamma_state = LevelState()
         self._cdf_flat_streak = 0
+        self._es_fallback_logged = False
+        self.static_open_day: str | None = None
+        self.static_open_call_wall: float | None = None
+        self.static_open_put_wall: float | None = None
+        self.static_open_pml: float | None = None
         self._setup_database()
         self._load_state()
 
@@ -245,6 +273,8 @@ class ForwardTester:
             ("bar_low", "DOUBLE"),
             ("bar_close", "DOUBLE"),
             ("charm_hedge", "DOUBLE"),
+            ("atm_call_iv", "DOUBLE"),
+            ("atm_put_iv", "DOUBLE"),
         ):
             self.db.execute(f"ALTER TABLE snapshots ADD COLUMN IF NOT EXISTS {name} {kind}")
         self.db.execute(
@@ -264,6 +294,8 @@ class ForwardTester:
             )
             """
         )
+        for name in ("mid_price", "executed_fill_price"):
+            self.db.execute(f"ALTER TABLE trades ADD COLUMN IF NOT EXISTS {name} DOUBLE")
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS balances (strategy VARCHAR PRIMARY KEY, balance DOUBLE)"
         )
@@ -313,6 +345,10 @@ class ForwardTester:
             stamped = saved.get(f"cooldown_{name}")
             if stamped:
                 self.cooldowns[name] = datetime.fromisoformat(stamped)
+        self.static_open_day = saved.get("static_open_day") or None
+        self.static_open_call_wall = _optional_float(saved.get("static_open_call_wall_1"))
+        self.static_open_put_wall = _optional_float(saved.get("static_open_put_wall_1"))
+        self.static_open_pml = _optional_float(saved.get("static_open_pml"))
 
         start = now_eastern().replace(hour=9, minute=30, second=0, microsecond=0)
         try:
@@ -435,6 +471,30 @@ class ForwardTester:
             )
         return updated
 
+    def _lock_open_levels(
+        self,
+        now: datetime,
+        call_wall: float | None,
+        put_wall: float | None,
+        chain: pd.DataFrame,
+    ) -> None:
+        """Freeze the 09:30 walls and overnight PML for the rest of the session."""
+        day = now.date().isoformat()
+        if self.static_open_day == day:
+            return
+        if now.hour != 9 or now.minute != 30:
+            return
+        self.static_open_day = day
+        self.static_open_call_wall = call_wall
+        self.static_open_put_wall = put_wall
+        self.static_open_pml = overnight_pml(chain)
+        logging.info(
+            "Opening levels locked: call %.2f put %.2f PML %s",
+            float("nan") if call_wall is None else call_wall,
+            float("nan") if put_wall is None else put_wall,
+            "none" if self.static_open_pml is None else f"{self.static_open_pml:.2f}",
+        )
+
     def _collect(self) -> MarketSnapshot:
         now = now_eastern()
         spot = self.client.spot(SYMBOL)
@@ -444,6 +504,9 @@ class ForwardTester:
         latest = bands.iloc[-1]
         chain = fetch_intraday_chain(self.client, SYMBOL, now.date())
         intrad = build_intraday_snapshot(chain, spot, now)
+        self._lock_open_levels(now, intrad.call_wall, intrad.put_wall, chain)
+        peak = iv_peak_center(chain)
+        fear_upper, fear_lower = iv_max_fear_levels(chain, spot)
         gex_0_1 = fetch_near_term_gex(self.client, SYMBOL, now.date(), spot)
         call_wall, put_wall, zero_gamma, call_wall_2, put_wall_2 = self._stable_levels(
             now,
@@ -455,8 +518,20 @@ class ForwardTester:
         )
         minutes_left = minutes_remaining(now, session_close_time(now.date()))
         upper_1, lower_1, upper_2, lower_2 = expected_move_bands(
-            float(latest["vwap"]), spot, float(intrad.atm_iv), minutes_left
+            float(latest["vwap"]),
+            spot,
+            float(intrad.atm_iv),
+            minutes_left,
+            call_iv=intrad.atm_call_iv,
+            put_iv=intrad.atm_put_iv,
         )
+        momentum_bars, momentum_source = fetch_momentum_bars(
+            self.client, now.date(), session_close_time(now.date()), bars
+        )
+        if momentum_source != "/ES" and not self._es_fallback_logged:
+            logging.info("ES minute bars unavailable; momentum filter is using SPY closes")
+            self._es_fallback_logged = True
+        momentum_price, momentum_vwap, momentum_slope = momentum_features(momentum_bars)
         candle = bars.iloc[-1]
         book = self._macro_book(now)
         profile = calculate_strike_gex(book.gex_fields, spot)
@@ -492,6 +567,8 @@ class ForwardTester:
             zero_gamma=zero_gamma,
             cdf=_finite(intrad.cdf),
             atm_iv=_finite(intrad.atm_iv),
+            atm_call_iv=_finite(intrad.atm_call_iv),
+            atm_put_iv=_finite(intrad.atm_put_iv),
             vwap=float(latest["vwap"]),
             upper_1=upper_1,
             lower_1=lower_1,
@@ -513,6 +590,16 @@ class ForwardTester:
             macro_expiration=book.expiration.isoformat() if book.expiration else None,
             macro_dte=book.dte,
             bars_5=completed_five_minute(five_minute_bars(bars), now),
+            minute_bars=bars,
+            momentum_price=momentum_price,
+            momentum_vwap=momentum_vwap,
+            momentum_slope=momentum_slope,
+            iv_peak_center=peak,
+            iv_max_fear_upper=fear_upper,
+            iv_max_fear_lower=fear_lower,
+            static_open_call_wall_1=self.static_open_call_wall,
+            static_open_put_wall_1=self.static_open_put_wall,
+            static_open_pml=self.static_open_pml,
         )
 
     def _macro_book(self, now: datetime) -> MacroBook:
@@ -639,6 +726,13 @@ class ForwardTester:
                 snap.zero_gamma,
             ):
                 return "spot reverted to VWAP or zero gamma"
+            if touched_iv_peak(
+                position["direction"],
+                snap.spot,
+                float(position["entry_spot"]),
+                snap.iv_peak_center,
+            ):
+                return "spot touched the IV peak center"
             return None
         if marked is not None and position["direction"] == "bullish" and math.isfinite(snap.upper_2) and snap.spot >= snap.upper_2:
             return "spot reached the upper 2σ band"
@@ -651,14 +745,23 @@ class ForwardTester:
             return "cumulative delta flow flattened"
         return None
 
+    def _priced(self, chain: pd.DataFrame, legs: list[Leg], closing: bool) -> tuple[float, float] | None:
+        """Signed mid and the fill. Closing adds the spread back; opening subtracts it."""
+        nets = structure_nets(chain, legs)
+        if nets is None:
+            return None
+        mid, width = nets
+        slip = self.slippage_factor * width
+        return mid, mid + slip if closing else mid - slip
+
     def _exit_is_profitable(self, name: str, snap: MarketSnapshot) -> bool:
-        """A take-profit close has to be green after round-trip fees."""
+        """A take-profit close has to be green after round-trip fees and exit slippage."""
         position = self.positions[name]
-        marked = self._marked_net(position, snap.chain)
-        if marked is None:
+        priced = self._priced(snap.chain, position["legs"], closing=True)
+        if priced is None:
             return False
         fees = round_trip_fees(int(position["contracts"]), len(position["legs"]), FEE_PER_CONTRACT)
-        return trade_pnl(float(position["entry_net"]), marked, int(position["contracts"]), fees) > 0
+        return trade_pnl(float(position["entry_net"]), priced[1], int(position["contracts"]), fees) > 0
 
     def _macro_should_exit(self, snap: MarketSnapshot) -> bool:
         position = self.positions["macro"]
@@ -678,7 +781,7 @@ class ForwardTester:
             previous, bar, bar_key = bar_pair
             events.extend(self._intraday_entries(snap, previous, bar, bar_key))
         if (
-            self._in_settle(snap.now)
+            macro_entry_window(snap.now)
             and "macro" not in self.positions
             and self.macro_checked_day != snap.now.date().isoformat()
             and snap.blackout is None
@@ -743,6 +846,9 @@ class ForwardTester:
             cdf_prev=value_at_or_before(self.cdf_history, snap.now - timedelta(minutes=15)),
             iv_now=snap.atm_iv,
             iv_prev=value_at_or_before(self.iv_history, snap.now - timedelta(minutes=15)),
+            momentum_slope=snap.momentum_slope,
+            iv_max_fear_upper=snap.iv_max_fear_upper,
+            iv_max_fear_lower=snap.iv_max_fear_lower,
         )
         if signal is None:
             return None
@@ -774,6 +880,9 @@ class ForwardTester:
             cdf_30=value_at_or_before(self.cdf_history, snap.now - timedelta(minutes=30)),
             iv_now=snap.atm_iv,
             iv_prev=value_at_or_before(self.iv_history, snap.now - timedelta(minutes=15)),
+            momentum_price=snap.momentum_price,
+            momentum_vwap=snap.momentum_vwap,
+            momentum_slope=snap.momentum_slope,
         )
         if signal is None:
             return None
@@ -782,22 +891,23 @@ class ForwardTester:
 
     def _open_macro(self, snap: MarketSnapshot) -> dict[str, Any] | None:
         signal = macro_swing_signal(
-            spot=snap.spot,
-            previous_close=self.previous_close,
+            now=snap.now,
             macro_gex=snap.macro_gex,
             gamma_flip=snap.gamma_flip,
             hmm_state=snap.hmm,
-            previous_hmm=self.prior_hmm,
             ou_theta=snap.ou_theta,
+            fifteen_closes=completed_fifteen_minute_closes(snap.minute_bars, snap.now),
         )
         if signal is None:
             return None
-        self.macro_checked_day = snap.now.date().isoformat()
         if snap.macro_chain.empty:
             logging.info("Macro swing skipped: no 30–60 DTE chain to trade")
             return None
         legs = debit_legs(snap.macro_chain, "put_debit", snap.spot, width=5.0)
-        return self._open_from_signal(signal, legs, snap, snap.macro_chain, "")
+        opened = self._open_from_signal(signal, legs, snap, snap.macro_chain, "")
+        if opened is not None:
+            self.macro_checked_day = snap.now.date().isoformat()
+        return opened
 
     def _open_from_signal(
         self,
@@ -817,8 +927,13 @@ class ForwardTester:
         nets = structure_nets(chain, legs)
         if nets is None:
             return None
-        signed, _width = nets
-        loss = max_loss_per_contract(signed, legs)
+        signed, width = nets
+        fill = executed_fill(signed, width, self.slippage_factor)
+        rejected = fill_price_blocks(signed, fill, legs)
+        if rejected:
+            logging.info("%s blocked by fill: %s", signal.strategy, rejected)
+            return None
+        loss = max_loss_per_contract(fill, legs)
         contracts = contract_count(self.balances[signal.strategy], loss, RISK_FRACTION)
         if contracts < 1:
             logging.info("%s skipped: max loss $%.2f does not fit the 2%% budget", signal.strategy, loss)
@@ -829,7 +944,8 @@ class ForwardTester:
             "direction": signal.direction,
             "legs": legs,
             "contracts": contracts,
-            "entry_net": signed,
+            "entry_net": fill,
+            "entry_mid": signed,
             "entry_spot": snap.spot,
             "entry_time": snap.now,
             "entry_day": snap.now.date().isoformat(),
@@ -840,13 +956,22 @@ class ForwardTester:
             "expiration": snap.macro_expiration if signal.strategy == "macro" else snap.now.date().isoformat(),
         }
         logging.info(
-            "OPEN %s %s @ net %.2f | %s",
+            "OPEN %s %s @ fill %.2f mid %.2f | %s",
             signal.strategy,
             describe_legs(legs, contracts),
+            fill,
             signed,
             signal.reason,
         )
-        return self._event(signal.strategy, "OPEN", snap, pnl=None, detail=signal.reason)
+        return self._event(
+            signal.strategy,
+            "OPEN",
+            snap,
+            pnl=None,
+            detail=signal.reason,
+            mid_price=signed,
+            executed_fill_price=fill,
+        )
 
     def _close_position(
         self,
@@ -858,16 +983,18 @@ class ForwardTester:
     ) -> dict[str, Any] | None:
         position = self.positions[name]
         chain = snap.macro_chain if name == "macro" else snap.chain
-        marked = self._marked_net(position, chain)
+        priced = self._priced(chain, position["legs"], closing=True)
         used_intrinsic = False
-        if marked is None and allow_intrinsic:
-            marked = _intrinsic_net(position["legs"], snap.spot)
+        if priced is None and allow_intrinsic:
+            intrinsic = _intrinsic_net(position["legs"], snap.spot)
+            priced = (intrinsic, intrinsic)
             used_intrinsic = True
-        if marked is None:
+        if priced is None:
             logging.info("%s %s deferred: option quotes unavailable", name, event)
             return None
+        mid, fill = priced
         fees = round_trip_fees(position["contracts"], len(position["legs"]), FEE_PER_CONTRACT)
-        pnl = trade_pnl(float(position["entry_net"]), marked, int(position["contracts"]), fees)
+        pnl = trade_pnl(float(position["entry_net"]), fill, int(position["contracts"]), fees)
         self.balances[name] += pnl
         self.balances["cumulative"] = sum(self.balances[item] for item in STRATEGIES)
         if event == "STOP":
@@ -882,7 +1009,10 @@ class ForwardTester:
             pnl,
             self.balances[name],
         )
-        return self._event(name, event, snap, pnl=pnl, detail=detail, closed=position)
+        return self._event(
+            name, event, snap, pnl=pnl, detail=detail, closed=position,
+            mid_price=mid, executed_fill_price=fill,
+        )
 
     def _event(
         self,
@@ -892,6 +1022,8 @@ class ForwardTester:
         pnl: float | None,
         detail: str,
         closed: dict[str, Any] | None = None,
+        mid_price: float | None = None,
+        executed_fill_price: float | None = None,
     ) -> dict[str, Any]:
         position = closed or self.positions[strategy]
         return {
@@ -905,6 +1037,8 @@ class ForwardTester:
             "strategy_balance": self.balances[strategy],
             "cumulative_balance": self.balances["cumulative"],
             "detail": f"{describe_legs(position['legs'], position['contracts'])} | {detail}",
+            "mid_price": mid_price,
+            "executed_fill_price": executed_fill_price,
             "direction": position["direction"],
             "entry_net": float(position["entry_net"]),
             "entry_spot": float(position["entry_spot"]),
@@ -964,6 +1098,7 @@ class ForwardTester:
                 "put_wall_1_strike", "put_wall_1_gamma", "put_wall_2_strike", "put_wall_2_gamma",
                 "gex_0_1", "total_net_gex", "gex_volume", "charm_hedge",
                 "bar_open", "bar_high", "bar_low", "bar_close",
+                "atm_call_iv", "atm_put_iv",
             ]
             self.db.execute(
                 "INSERT INTO snapshots (" + ", ".join(columns) + ") VALUES ("
@@ -1009,11 +1144,19 @@ class ForwardTester:
                     _db_float(snap.bar_high),
                     _db_float(snap.bar_low),
                     _db_float(snap.bar_close),
+                    _db_float(snap.atm_call_iv),
+                    _db_float(snap.atm_put_iv),
                 ],
             )
+            trade_columns = [
+                "ts", "strategy", "event", "structure", "contracts", "spot", "pnl",
+                "strategy_balance", "cumulative_balance", "detail", "metrics",
+                "mid_price", "executed_fill_price",
+            ]
             for event in events:
                 self.db.execute(
-                    "INSERT INTO trades VALUES (" + ",".join(["?"] * 11) + ")",
+                    "INSERT INTO trades (" + ", ".join(trade_columns) + ") VALUES ("
+                    + ",".join(["?"] * len(trade_columns)) + ")",
                     [
                         event["ts"],
                         event["strategy"],
@@ -1026,6 +1169,8 @@ class ForwardTester:
                         event["cumulative_balance"],
                         event["detail"],
                         metrics,
+                        _db_float(event.get("mid_price")),
+                        _db_float(event.get("executed_fill_price")),
                     ],
                 )
             for name in (*STRATEGIES, "cumulative"):
@@ -1048,6 +1193,10 @@ class ForwardTester:
                 "closing_spot": "" if self.closing_spot is None else str(self.closing_spot),
                 "closing_day": self.closing_day or "",
                 "macro_checked_day": self.macro_checked_day or "",
+                "static_open_day": self.static_open_day or "",
+                "static_open_call_wall_1": "" if self.static_open_call_wall is None else str(self.static_open_call_wall),
+                "static_open_put_wall_1": "" if self.static_open_put_wall is None else str(self.static_open_put_wall),
+                "static_open_pml": "" if self.static_open_pml is None else str(self.static_open_pml),
             }
             for name in STRATEGIES:
                 until = self.cooldowns.get(name)

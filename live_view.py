@@ -20,6 +20,25 @@ from ta_engine import expected_move_bands, minutes_remaining
 STRATEGIES = ("absorption", "cascade", "macro")
 
 
+def _static_open_levels(db, session_date: str) -> dict[str, float | None]:
+    """Opening walls and PML stay on the chart only for the session that locked them."""
+    empty = {
+        "static_open_call_wall_1": None,
+        "static_open_put_wall_1": None,
+        "static_open_pml": None,
+    }
+    try:
+        saved = {
+            str(key): str(value)
+            for key, value in db.execute("SELECT key, value FROM session_state").fetchall()
+        }
+    except Exception:
+        return empty
+    if saved.get("static_open_day") != session_date:
+        return empty
+    return {name: _num(saved.get(name)) if saved.get(name) else None for name in empty}
+
+
 def live_view_path() -> str:
     explicit = os.environ.get("LIVE_VIEW_PATH")
     if explicit:
@@ -59,6 +78,7 @@ def build_live_view(db) -> dict[str, Any]:
         }
 
     session_date = str(latest_ts)[:10]
+    static_levels = _static_open_levels(db, session_date)
     available = {row[0] for row in db.execute("DESCRIBE snapshots").fetchall()}
     extra_names = [
         name
@@ -73,6 +93,8 @@ def build_live_view(db) -> dict[str, Any]:
             "bar_high",
             "bar_low",
             "bar_close",
+            "atm_call_iv",
+            "atm_put_iv",
         )
         if name in available
     ]
@@ -118,11 +140,15 @@ def build_live_view(db) -> dict[str, Any]:
         vwap = _num(row[7])
         atm_iv = _num(row[6])
         stamped = datetime.fromisoformat(str(row[0]))
+        call_iv = _num(_extra(row, "atm_call_iv"))
+        put_iv = _num(_extra(row, "atm_put_iv"))
         upper_1, lower_1, upper_2, lower_2 = expected_move_bands(
             float("nan") if vwap is None else vwap,
             float("nan") if spot is None else spot,
             float("nan") if atm_iv is None else atm_iv,
             minutes_remaining(stamped, session_close_time(stamped.date())),
+            call_iv=float("nan") if call_iv is None else call_iv,
+            put_iv=float("nan") if put_iv is None else put_iv,
         )
         macro_gex = _num(row[13])
         near_gex = _num(_extra(row, "gex_0_1"))
@@ -152,6 +178,9 @@ def build_live_view(db) -> dict[str, Any]:
             "lower_1": _num(lower_1),
             "upper_2": _num(upper_2),
             "lower_2": _num(lower_2),
+            "static_open_call_wall_1": static_levels["static_open_call_wall_1"],
+            "static_open_put_wall_1": static_levels["static_open_put_wall_1"],
+            "static_open_pml": static_levels["static_open_pml"],
         })
         flow.append({
             "time": moment,
@@ -204,6 +233,9 @@ def build_live_view(db) -> dict[str, Any]:
             "macro_regime": last[15],
             "hmm": None if last[16] is None else int(last[16]),
             "entry_block": last[17] or None,
+            "static_open_call_wall_1": static_levels["static_open_call_wall_1"],
+            "static_open_put_wall_1": static_levels["static_open_put_wall_1"],
+            "static_open_pml": static_levels["static_open_pml"],
         },
         "balances": balances,
         "positions": _positions(db),

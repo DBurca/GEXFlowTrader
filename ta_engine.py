@@ -59,13 +59,21 @@ def expected_move_bands(
     spot: float,
     atm_iv: float,
     minutes_left: float = SESSION_MINUTES,
+    call_iv: float | None = None,
+    put_iv: float | None = None,
 ) -> tuple[float, float, float, float]:
-    """VWAP ± 1 and ± 2 remaining-session moves. Returns upper_1, lower_1, upper_2, lower_2."""
-    width = expected_move(spot, atm_iv, minutes_left)
-    if not np.isfinite(vwap) or not np.isfinite(width):
+    """VWAP plus call-IV width and minus put-IV width. Returns upper_1, lower_1, upper_2, lower_2.
+
+    A missing side falls back to the combined ATM IV, so an older snapshot stays symmetric.
+    """
+    up_iv = call_iv if call_iv is not None and np.isfinite(call_iv) and call_iv > 0 else atm_iv
+    down_iv = put_iv if put_iv is not None and np.isfinite(put_iv) and put_iv > 0 else atm_iv
+    upper = expected_move(spot, up_iv, minutes_left)
+    lower = expected_move(spot, down_iv, minutes_left)
+    if not np.isfinite(vwap) or not np.isfinite(upper) or not np.isfinite(lower):
         nan = float("nan")
         return nan, nan, nan, nan
-    return vwap + width, vwap - width, vwap + 2.0 * width, vwap - 2.0 * width
+    return vwap + upper, vwap - lower, vwap + 2.0 * upper, vwap - 2.0 * lower
 
 
 def calculate_vwap_bands(bars: pd.DataFrame) -> pd.DataFrame:

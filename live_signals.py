@@ -8,6 +8,7 @@ forward test keeps one defined-risk position per strategy account.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime, time
 
@@ -193,6 +194,9 @@ def absorption_signal(
     cdf_prev: float | None,
     iv_now: float | None,
     iv_prev: float | None,
+    momentum_slope: float | None = None,
+    iv_max_fear_upper: float | None = None,
+    iv_max_fear_lower: float | None = None,
 ) -> EntrySignal | None:
     """+GEX mean reversion: a 5-minute test that fails to close through the boundary."""
     if intrad_gex <= 0 or macro_gex < 0 or hmm_state != 0:
@@ -223,11 +227,21 @@ def absorption_signal(
         key=lambda item: (0 if "wall" in item[2] else 1, abs(item[1] - float(bar["Close"])))
     )
     direction, anchor, label = candidates[0]
+    if momentum_slope is not None and (
+        not np.isfinite(momentum_slope)
+        or (direction == "bullish" and momentum_slope < -0.05)
+        or (direction == "bearish" and momentum_slope > 0.05)
+    ):
+        return None
     if not _cdf_supports_fade(direction, float(cdf_now), float(cdf_prev)):
         return None
     structure = "put_credit" if direction == "bullish" else "call_credit"
     stop = None
-    if "1σ" in label:
+    if direction == "bearish" and iv_max_fear_upper is not None and iv_max_fear_upper > float(anchor):
+        stop = float(iv_max_fear_upper)
+    elif direction == "bullish" and iv_max_fear_lower is not None and iv_max_fear_lower < float(anchor):
+        stop = float(iv_max_fear_lower)
+    elif "1σ" in label:
         outer = put_wall_2 if direction == "bullish" else call_wall_2
         if outer is not None:
             stop = float(outer)
@@ -268,6 +282,9 @@ def cascade_signal(
     cdf_30: float | None,
     iv_now: float | None,
     iv_prev: float | None,
+    momentum_price: float | None = None,
+    momentum_vwap: float | None = None,
+    momentum_slope: float | None = None,
 ) -> EntrySignal | None:
     """-GEX breakout: a 5-minute close through zero gamma or a wall."""
     flip_breached = gamma_flip is not None and spot < gamma_flip
@@ -300,7 +317,13 @@ def cascade_signal(
         if zero_gamma is not None and _broke_down(previous, bar, zero_gamma):
             downside.append((zero_gamma, "zero gamma"))
 
-    if upside and bar["Close"] > vwap and latest_change > 0 and latest_change > prior_change:
+    if (
+        upside
+        and bar["Close"] > vwap
+        and latest_change > 0
+        and latest_change > prior_change
+        and _momentum_aligned("bullish", momentum_price, momentum_vwap, momentum_slope)
+    ):
         anchor, label = upside[0]
         return EntrySignal(
             strategy="cascade",
@@ -309,7 +332,13 @@ def cascade_signal(
             anchor=float(anchor),
             reason=f"5-minute close through {label} with accelerating CDF and rising IV",
         )
-    if downside and bar["Close"] < vwap and latest_change < 0 and latest_change < prior_change:
+    if (
+        downside
+        and bar["Close"] < vwap
+        and latest_change < 0
+        and latest_change < prior_change
+        and _momentum_aligned("bearish", momentum_price, momentum_vwap, momentum_slope)
+    ):
         anchor, label = downside[0]
         return EntrySignal(
             strategy="cascade",
@@ -321,35 +350,83 @@ def cascade_signal(
     return None
 
 
+MACRO_ENTRY_START = 11 * 60
+MACRO_ENTRY_END = 15 * 60 + 55
+
+
+def macro_entry_window(now: datetime) -> bool:
+    """11:00 through 15:55 ET, using the clock on ``now``."""
+    minutes = now.hour * 60 + now.minute
+    return MACRO_ENTRY_START <= minutes <= MACRO_ENTRY_END
+
+
+def completed_fifteen_minute_closes(minute_bars: pd.DataFrame, now: datetime) -> list[float]:
+    """Closes of 15-minute bars that have finished by ``now``."""
+    if minute_bars.empty or "Close" not in minute_bars.columns:
+        return []
+    grouped = (
+        minute_bars.sort_index()
+        .resample("15min", label="left", closed="left")
+        .agg({"Close": "last"})
+        .dropna(subset=["Close"])
+    )
+    if grouped.empty:
+        return []
+    cutoff = pd.Timestamp(now)
+    if cutoff.tzinfo is not None and grouped.index.tz is None:
+        cutoff = cutoff.tz_localize(None)
+    elif cutoff.tzinfo is None and grouped.index.tz is not None:
+        cutoff = cutoff.tz_localize(grouped.index.tz)
+    finished = grouped.index + pd.Timedelta(minutes=15) <= cutoff
+    return [float(value) for value in grouped.loc[finished, "Close"].tolist()]
+
+
+def _momentum_aligned(
+    direction: str,
+    price: float | None,
+    vwap: float | None,
+    slope: float | None,
+) -> bool:
+    """ES (or the SPY fallback) must agree with the breakout. Omitted inputs stay open for older callers."""
+    if price is None and vwap is None and slope is None:
+        return True
+    if price is None or vwap is None or slope is None:
+        return False
+    if not (np.isfinite(price) and np.isfinite(vwap) and np.isfinite(slope)):
+        return False
+    if direction == "bullish":
+        return price > vwap and slope > 0
+    return price < vwap and slope < 0
+
+
 def macro_swing_signal(
     *,
-    spot: float,
-    previous_close: float | None,
+    now: datetime,
     macro_gex: float,
     gamma_flip: float | None,
     hmm_state: int | None,
-    previous_hmm: int | None,
     ou_theta: float | None,
+    fifteen_closes: list[float],
 ) -> EntrySignal | None:
-    """Daily close below the macro gamma flip while the slow book turns negative."""
-    if gamma_flip is None or not np.isfinite(gamma_flip) or spot >= gamma_flip:
+    """Intraday put debit once two 15-minute closes are under the macro flip."""
+    if not macro_entry_window(now):
         return None
-    transitioning = macro_gex < 0 or (
-        previous_close is not None and previous_close >= gamma_flip
-    )
-    if not transitioning:
+    if gamma_flip is None or not np.isfinite(gamma_flip) or macro_gex >= 0:
         return None
-    hmm_shift = previous_hmm == 0 and hmm_state == 1
-    ou_faded = ou_theta is not None and ou_theta <= OU_THETA_FLOOR
-    if not (hmm_shift or ou_faded):
+    if len(fifteen_closes) < 2:
         return None
-    why = "HMM 0→1" if hmm_shift else "OU mean reversion faded"
+    if fifteen_closes[-1] >= gamma_flip or fifteen_closes[-2] >= gamma_flip:
+        return None
+    trend = hmm_state == 1 or (ou_theta is not None and ou_theta <= OU_THETA_FLOOR)
+    if not trend:
+        return None
+    why = "HMM state 1" if hmm_state == 1 else "OU mean reversion faded"
     return EntrySignal(
         strategy="macro",
         direction="bearish",
         structure="put_debit_macro",
         anchor=float(gamma_flip),
-        reason=f"daily close below macro gamma flip, {why}",
+        reason=f"ENTER_MACRO_PUT_DEBIT, two 15-minute closes below the flip, {why}",
     )
 
 
@@ -463,6 +540,26 @@ def structure_nets(chain: pd.DataFrame, legs: list[Leg]) -> tuple[float, float] 
     return signed, width
 
 
+def executed_fill(signed_mid: float, total_width: float, factor: float) -> float:
+    """Worse than the signed mid by ``factor`` times the summed bid-ask width.
+
+    A credit is received for less. A debit, whose signed mid is negative, is
+    paid for more. Both are ``signed mid − factor × Σ(ask − bid)``.
+    """
+    return float(signed_mid) - float(factor) * float(total_width)
+
+
+def fill_price_blocks(signed_mid: float, fill: float, legs: list[Leg]) -> str | None:
+    """Reject a debit that costs at least the strike width, or a credit at or under $0.05."""
+    if signed_mid < 0:
+        if -fill >= spread_width(legs):
+            return "debit fill is at least the strike width"
+        return None
+    if fill <= 0.05:
+        return "credit fill is at or below 0.05"
+    return None
+
+
 def slippage_blocks(chain: pd.DataFrame, legs: list[Leg], max_ratio: float) -> str | None:
     """Reason the order is blocked, or None when the quote is tight enough."""
     nets = structure_nets(chain, legs)
@@ -541,6 +638,20 @@ def next_cdf_flat_streak(streak: int, is_flat: bool) -> tuple[int, bool]:
     """Advance the consecutive-poll count. The second value is true once it holds."""
     streak = streak + 1 if is_flat else 0
     return streak, streak >= CDF_FLAT_CONFIRM
+
+
+def touched_iv_peak(
+    direction: str,
+    spot: float,
+    entry_spot: float,
+    peak: float | None,
+) -> bool:
+    """Spot has reached the IV peak center from the fade entry."""
+    if peak is None or not math.isfinite(peak) or not math.isfinite(spot):
+        return False
+    if direction == "bullish":
+        return peak >= entry_spot and spot >= peak
+    return peak <= entry_spot and spot <= peak
 
 
 def reverted_to_mean(

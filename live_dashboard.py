@@ -60,7 +60,7 @@ PAGE = """<!DOCTYPE html>
   </div>
   <p class="sub">Dollars. Clock labels are Eastern. Candles are the one-minute bar. The dotted purple lines are the 1σ move still left in the session, spot × ATM IV × sqrt(minutes left / (390 × 252)), centered on VWAP. They move toward VWAP as the session runs out. A secondary wall is dashed in the wall's own color, and only drawn when its dollar gamma is at least 80% of the primary.</p>
   <div id="price" class="chart"></div>
-  <div class="legend"><span><i style="background:#7dcea0"></i>Up</span><span><i style="background:#e06c75"></i>Down</span><span><i style="background:#8aa0b4"></i>VWAP</span><span><i class="dot" style="border-color:#c084fc"></i>1σ</span><span><i style="background:#e06c75"></i>Call wall</span><span><i class="dash" style="border-color:#e06c75"></i>Call 2</span><span><i style="background:#7dcea0"></i>Put wall</span><span><i class="dash" style="border-color:#7dcea0"></i>Put 2</span><span><i style="background:#e6c07b"></i>Zero gamma</span></div>
+  <div class="legend"><span><i style="background:#7dcea0"></i>Up</span><span><i style="background:#e06c75"></i>Down</span><span><i style="background:#8aa0b4"></i>VWAP</span><span><i class="dot" style="border-color:#c084fc"></i>1σ</span><span><i style="background:#e06c75"></i>Call wall</span><span><i class="dash" style="border-color:#e06c75"></i>Call 2</span><span><i style="background:#7dcea0"></i>Put wall</span><span><i class="dash" style="border-color:#7dcea0"></i>Put 2</span><span><i class="dot" style="border-color:#e06c75"></i>Open call</span><span><i class="dot" style="border-color:#7dcea0"></i>Open put</span><span><i class="dot" style="border-color:#d7e3ea"></i>Open PML</span><span><i style="background:#e6c07b"></i>Zero gamma</span></div>
   </section>
   <h2>Cumulative delta flow</h2>
   <p class="sub">Share-delta, in millions.</p>
@@ -225,6 +225,9 @@ function render(data) {
   series(price, "put", { color: "#7dcea0", lineWidth: 2, title: "Put wall", priceLineVisible: false }).setData(lineData(data.price || [], "put_wall"));
   setLine(price, "put2", { ...quiet, color: "#7dcea0", lineStyle: LightweightCharts.LineStyle.Dashed }, data.price || [], "put_wall_2");
   series(price, "zero", { color: "#e6c07b", lineWidth: 1, title: "Zero gamma", priceLineVisible: false }).setData(lineData(data.price || [], "zero_gamma"));
+  setLine(price, "openCall", { ...quiet, color: "#e06c75", lineStyle: LightweightCharts.LineStyle.Dotted }, data.price || [], "static_open_call_wall_1");
+  setLine(price, "openPut", { ...quiet, color: "#7dcea0", lineStyle: LightweightCharts.LineStyle.Dotted }, data.price || [], "static_open_put_wall_1");
+  setLine(price, "openPml", { ...quiet, color: "#d7e3ea", lineStyle: LightweightCharts.LineStyle.Dotted }, data.price || [], "static_open_pml");
   const markers = (data.trades || []).map((trade) => ({
     time: trade.time,
     position: trade.event === "OPEN" ? "belowBar" : "aboveBar",
@@ -235,7 +238,7 @@ function render(data) {
   price.series.candle.setMarkers(markers);
   const scaleValues = [];
   for (const row of data.price || []) {
-    for (const key of ["high", "low", "spot", "upper_1", "lower_1"]) {
+    for (const key of ["high", "low", "spot", "upper_1", "lower_1", "static_open_call_wall_1", "static_open_put_wall_1", "static_open_pml"]) {
       if (row[key] != null) scaleValues.push(row[key]);
     }
   }

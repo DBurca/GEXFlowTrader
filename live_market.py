@@ -231,6 +231,22 @@ class SchwabSession:
         return payload
 
 
+ES_SYMBOL = "/ES"
+
+
+def fetch_momentum_bars(
+    client: SchwabSession,
+    session_day: date,
+    close_at: datetime,
+    spy_bars: pd.DataFrame,
+) -> tuple[pd.DataFrame, str]:
+    """1-minute /ES bars for the cash session. SPY closes stand in when the futures feed fails."""
+    try:
+        return session_bars(client.minute_bars(ES_SYMBOL), session_day, close_at), ES_SYMBOL
+    except MarketDataError:
+        return spy_bars, "SPY"
+
+
 def session_bars(bars: pd.DataFrame, session_day: date, close_at: datetime) -> pd.DataFrame:
     index = pd.DatetimeIndex(bars.index)
     if index.tz is None:
