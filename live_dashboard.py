@@ -58,7 +58,7 @@ PAGE = """<!DOCTYPE html>
     <h2>Spot, VWAP, bands, and 0DTE walls</h2>
     <button type="button" id="fullscreen">Full screen</button>
   </div>
-  <p class="sub">Dollars. Clock labels are Eastern. Candles are the one-minute bar. The dotted purple lines are the 1σ move still left in the session, spot × ATM IV × sqrt(minutes left / (390 × 252)), centered on VWAP. They move toward VWAP as the session runs out. A secondary wall is dashed in the wall's own color, and only drawn when its dollar gamma is at least 80% of the primary.</p>
+  <p class="sub">Dollars. Clock labels are Eastern. Candles are the session's one-minute history from Schwab, replaced each minute, with the latest spot written into the current bar. The dotted purple lines are the 1σ move still left in the session, spot × ATM IV × sqrt(minutes left / (390 × 252)), centered on VWAP. They move toward VWAP as the session runs out. A secondary wall is dashed in the wall's own color, and only drawn when its dollar gamma is at least 80% of the primary.</p>
   <div id="price" class="chart"></div>
   <div class="legend"><span><i style="background:#7dcea0"></i>Up</span><span><i style="background:#e06c75"></i>Down</span><span><i style="background:#8aa0b4"></i>VWAP</span><span><i class="dot" style="border-color:#c084fc"></i>1σ</span><span><i style="background:#e06c75"></i>Call wall</span><span><i class="dash" style="border-color:#e06c75"></i>Call 2</span><span><i style="background:#7dcea0"></i>Put wall</span><span><i class="dash" style="border-color:#7dcea0"></i>Put 2</span><span><i class="dot" style="border-color:#e06c75"></i>Open call</span><span><i class="dot" style="border-color:#7dcea0"></i>Open put</span><span><i class="dot" style="border-color:#d7e3ea"></i>Open PML</span><span><i style="background:#e6c07b"></i>Zero gamma</span></div>
   </section>
@@ -215,7 +215,8 @@ function render(data) {
   ).join("");
 
   const price = ensureChart("price", chartOptions());
-  candleSeries(price).setData(candleData(data.price || []));
+  const candles = (data.candles && data.candles.length) ? data.candles : candleData(data.price || []);
+  candleSeries(price).setData(candles);
   series(price, "vwap", { color: "#8aa0b4", lineWidth: 1, title: "VWAP", priceLineVisible: false }).setData(lineData(data.price || [], "vwap"));
   const quiet = { lineWidth: 1, priceLineVisible: false, lastValueVisible: false, title: "" };
   series(price, "u1", { ...quiet, color: "#c084fc", lineStyle: LightweightCharts.LineStyle.Dotted }).setData(lineData(data.price || [], "upper_1"));
@@ -229,7 +230,7 @@ function render(data) {
   setLine(price, "openPut", { ...quiet, color: "#7dcea0", lineStyle: LightweightCharts.LineStyle.Dotted }, data.price || [], "static_open_put_wall_1");
   setLine(price, "openPml", { ...quiet, color: "#d7e3ea", lineStyle: LightweightCharts.LineStyle.Dotted }, data.price || [], "static_open_pml");
   const markers = (data.trades || []).map((trade) => ({
-    time: trade.time,
+    time: data.candles && data.candles.length ? Math.floor(trade.time / 60) * 60 : trade.time,
     position: trade.event === "OPEN" ? "belowBar" : "aboveBar",
     color: trade.event === "STOP" ? "#e06c75" : trade.event === "OPEN" ? "#7dcea0" : "#6cb6ff",
     shape: trade.event === "OPEN" ? "arrowUp" : "arrowDown",
@@ -241,6 +242,10 @@ function render(data) {
     for (const key of ["high", "low", "spot", "upper_1", "lower_1", "static_open_call_wall_1", "static_open_put_wall_1", "static_open_pml"]) {
       if (row[key] != null) scaleValues.push(row[key]);
     }
+  }
+  for (const row of candles) {
+    if (row.high != null) scaleValues.push(row.high);
+    if (row.low != null) scaleValues.push(row.low);
   }
   if (scaleValues.length) {
     const low = Math.min(...scaleValues);

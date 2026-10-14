@@ -826,6 +826,44 @@ def test_open_levels_peak_and_fear() -> None:
         reloaded.shutdown()
 
 
+def test_price_history_redraws_the_session() -> None:
+    os.environ.setdefault("SCHWAB_APP_KEY", "test-key")
+    os.environ.setdefault("SCHWAB_APP_SECRET", "test-secret")
+    os.environ.setdefault("SCHWAB_REFRESH_TOKEN", "test-token")
+    os.environ["DISCORD_WEBHOOK_URL"] = ""
+    with tempfile.TemporaryDirectory() as folder:
+        os.environ["DUCKDB_PATH"] = os.path.join(folder, "forward_test.db")
+        from live_forward import ForwardTester
+        from live_view import build_live_view
+
+        bot = ForwardTester()
+        snap = _snapshot()
+        gap = pd.date_range("2026-10-08 09:30", periods=2, freq="2min", tz=EASTERN)
+        snap.minute_bars = pd.DataFrame(
+            {"Open": [1.0, 3.0], "High": [2.0, 4.0], "Low": [0.5, 2.5], "Close": [1.5, 3.5]},
+            index=gap,
+        )
+        bot._persist(snap, [])
+        gappy = build_live_view(bot.db)["candles"]
+        assert [row["time"] for row in gappy].count(int(pd.Timestamp("2026-10-08 09:31", tz=EASTERN).timestamp())) == 0
+
+        full = pd.date_range("2026-10-08 09:30", periods=3, freq="1min", tz=EASTERN)
+        full = full.append(pd.DatetimeIndex([pd.Timestamp("2026-10-08 10:00", tz=EASTERN)]))
+        snap.minute_bars = pd.DataFrame(
+            {"Open": [1.0, 2.0, 3.0, 4.0], "High": [2.0, 2.5, 4.0, 4.2], "Low": [0.5, 1.5, 2.5, 3.8], "Close": [1.5, 2.2, 3.5, 4.0]},
+            index=full,
+        )
+        snap.spot = 501.0
+        bot._persist(snap, [])
+        candles = build_live_view(bot.db)["candles"]
+        stamps = [datetime.fromtimestamp(row["time"], EASTERN).strftime("%H:%M") for row in candles]
+        assert stamps == ["09:30", "09:31", "09:32", "10:00"]
+        assert candles[-1]["close"] == 501.0
+        assert candles[-1]["high"] == 501.0
+        assert candles[-1]["low"] == 3.8
+        bot.shutdown()
+
+
 if __name__ == "__main__":
     test_calendar()
     test_absorption_and_cascade()
@@ -841,4 +879,5 @@ if __name__ == "__main__":
     test_cdf_flat_needs_three_polls()
     test_momentum_and_skew_guards()
     test_open_levels_peak_and_fear()
+    test_price_history_redraws_the_session()
     print("forward logic checks passed")

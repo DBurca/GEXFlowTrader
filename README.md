@@ -259,7 +259,7 @@ erDiagram
 
 | Series | Drawing |
 | --- | --- |
-| Price | One-minute candles |
+| Price | Session one-minute history, replaced each poll, with the latest spot in the current bar |
 | VWAP | Solid gray |
 | 1σ | Dotted purple, remaining-session expected move around VWAP |
 | Call wall 1 | Solid red |

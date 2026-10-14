@@ -297,6 +297,17 @@ class ForwardTester:
         for name in ("mid_price", "executed_fill_price"):
             self.db.execute(f"ALTER TABLE trades ADD COLUMN IF NOT EXISTS {name} DOUBLE")
         self.db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS price_bars (
+                ts VARCHAR PRIMARY KEY,
+                open DOUBLE,
+                high DOUBLE,
+                low DOUBLE,
+                close DOUBLE
+            )
+            """
+        )
+        self.db.execute(
             "CREATE TABLE IF NOT EXISTS balances (strategy VARCHAR PRIMARY KEY, balance DOUBLE)"
         )
         self.db.execute(
@@ -1204,10 +1215,30 @@ class ForwardTester:
             for key, value in state.items():
                 self.db.execute("DELETE FROM session_state WHERE key = ?", [key])
                 self.db.execute("INSERT INTO session_state VALUES (?, ?)", [key, value])
+            self._replace_price_bars(snap)
             self.db.execute("COMMIT")
         except Exception:
             self.db.execute("ROLLBACK")
             raise
+
+    def _replace_price_bars(self, snap: MarketSnapshot) -> None:
+        """Replace this session's minute bars with the latest history from Schwab."""
+        day = snap.now.date().isoformat()
+        self.db.execute("DELETE FROM price_bars WHERE starts_with(ts, ?)", [day])
+        bars = snap.minute_bars
+        if bars is None or bars.empty:
+            return
+        for ts, row in bars.iterrows():
+            self.db.execute(
+                "INSERT INTO price_bars VALUES (?, ?, ?, ?, ?)",
+                [
+                    pd.Timestamp(ts).isoformat(),
+                    float(row["Open"]),
+                    float(row["High"]),
+                    float(row["Low"]),
+                    float(row["Close"]),
+                ],
+            )
 
     def _publish_view(self) -> None:
         try:

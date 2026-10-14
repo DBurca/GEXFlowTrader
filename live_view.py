@@ -72,6 +72,7 @@ def build_live_view(db) -> dict[str, Any]:
             "balances": _balances(db),
             "positions": _positions(db),
             "price": [],
+            "candles": [],
             "flow": [],
             "pnl": [],
             "trades": [],
@@ -240,11 +241,55 @@ def build_live_view(db) -> dict[str, Any]:
         "balances": balances,
         "positions": _positions(db),
         "price": price,
+        "candles": _session_candles(db, session_date, _num(last[1]), str(latest_ts)),
         "flow": flow,
         "gex": gex,
         "pnl": _pnl_series(rows, trades, balances),
         "trades": trades,
     }
+
+
+def _session_candles(db, session_date: str, spot: float | None, as_of: str) -> list[dict[str, Any]]:
+    """Full session minute history, with the latest spot written into the current minute."""
+    try:
+        rows = db.execute(
+            """
+            SELECT ts, open, high, low, close FROM price_bars
+            WHERE starts_with(ts, ?)
+            ORDER BY ts
+            """,
+            [session_date],
+        ).fetchall()
+    except Exception:
+        return []
+    candles: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for ts, open_, high, low, close in rows:
+        moment = _unix(str(ts)) // 60 * 60
+        if moment in seen:
+            continue
+        values = [_num(open_), _num(high), _num(low), _num(close)]
+        if any(value is None for value in values):
+            continue
+        seen.add(moment)
+        candles.append({
+            "time": moment,
+            "open": values[0],
+            "high": values[1],
+            "low": values[2],
+            "close": values[3],
+        })
+    if spot is None:
+        return candles
+    minute = _unix(as_of) // 60 * 60
+    if candles and candles[-1]["time"] == minute:
+        last = candles[-1]
+        last["high"] = max(float(last["high"]), spot)
+        last["low"] = min(float(last["low"]), spot)
+        last["close"] = spot
+    elif not candles or candles[-1]["time"] < minute:
+        candles.append({"time": minute, "open": spot, "high": spot, "low": spot, "close": spot})
+    return candles
 
 
 def _balances(db) -> dict[str, float]:
