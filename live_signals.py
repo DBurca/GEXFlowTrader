@@ -616,6 +616,41 @@ def max_loss_per_contract(signed_net: float, legs: list[Leg]) -> float:
     return abs(signed_net) * 100.0
 
 
+RISK_STOP_FRACTION = 0.50
+
+
+def intrabar_stop(
+    direction: str,
+    spot: float,
+    stop: float | None,
+    entry_net: float,
+    marked_net: float | None,
+    contracts: int,
+    legs: list[Leg],
+) -> str | None:
+    """Stop on the live spot or once half the defined risk is gone. No 5-minute wait."""
+    if stop is not None and math.isfinite(spot) and math.isfinite(stop):
+        if direction == "bullish" and spot < stop:
+            return "spot through the structural stop"
+        if direction == "bearish" and spot > stop:
+            return "spot through the structural stop"
+    if marked_net is None or contracts < 1:
+        return None
+    defined = max_loss_per_contract(entry_net, legs) * contracts
+    if defined <= 0:
+        return None
+    if trade_pnl(entry_net, marked_net, contracts, 0.0) <= -RISK_STOP_FRACTION * defined:
+        return "half of defined risk lost"
+    return None
+
+
+def exit_slippage_factor(strategy: str, event: str, base: float) -> float:
+    """Cascade entries and panic exits cross the spread. Calm credits keep the base factor."""
+    if event in {"STOP", "MARKET_FLATTEN"} or (event == "OPEN" and strategy == "cascade"):
+        return max(float(base), 1.0)
+    return float(base)
+
+
 def trade_pnl(
     entry_net: float,
     current_net: float,

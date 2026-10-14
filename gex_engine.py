@@ -8,9 +8,11 @@ book for the regime and zero-gamma line, and an open-interest book for walls.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
+
+import math
 
 import numpy as np
 import pandas as pd
@@ -61,7 +63,6 @@ def classify_regime(total_net_gex: float) -> str:
 # ---------------------------------------------------------------------------
 
 EASTERN = ZoneInfo("America/New_York")
-OI_WEIGHT_UNTIL = time(10, 30)
 CONTRACT_MULTIPLIER = 100.0
 ONE_PERCENT = 0.01
 
@@ -130,24 +131,33 @@ def _finite(values: Any) -> np.ndarray:
     return np.nan_to_num(array, nan=0.0, posinf=0.0, neginf=0.0)
 
 
+# Smooth blend from open interest at the cash open toward session volume.
+# t = 0 is 09:30. By the close the volume share is about 0.76, with no step.
+WEIGHT_DECAY = 0.0075
+VOL_WEIGHT_CLOSE = 0.8
+
+
+def positioning_weights(as_of: datetime | pd.Timestamp) -> tuple[float, float]:
+    """Return (open-interest weight, volume weight) for the minute since 09:30."""
+    stamp = _as_eastern(as_of)
+    minutes = (stamp.hour * 60 + stamp.minute) - (9 * 60 + 30)
+    elapsed = max(0.0, min(float(minutes), 390.0))
+    volume_weight = VOL_WEIGHT_CLOSE * (1.0 - math.exp(-WEIGHT_DECAY * elapsed))
+    return 1.0 - volume_weight, volume_weight
+
+
 def positioning_weight(
     open_interest: Any,
     volume: Any,
     as_of: datetime | pd.Timestamp,
 ) -> np.ndarray:
-    """
-    Intraday positioning blend.
-
-    From the cash open through 10:30 ET the weight is open interest.
-    After 10:30 ET it is ``0.4 * OI + 0.6 * intraday volume``.
-    """
+    """Continuous blend of open interest and session volume. No 10:30 step."""
     oi = _finite(open_interest)
     traded = _finite(volume)
     if oi.shape != traded.shape:
         raise ValueError("open interest and volume must have the same shape.")
-    if _as_eastern(as_of).time() <= OI_WEIGHT_UNTIL:
-        return oi.copy()
-    return 0.4 * oi + 0.6 * traded
+    oi_weight, volume_weight = positioning_weights(as_of)
+    return oi_weight * oi + volume_weight * traded
 
 
 def dollar_gamma(gamma: Any, weight: Any, spot: float) -> np.ndarray:
@@ -492,10 +502,10 @@ def call_wall_strike(exposure: pd.DataFrame) -> float | None:
 
 
 # A one-strike step on SPY is a real wall walk. Anything farther has to
-# repeat for three polls before it replaces the level. One bad gamma quote
+# repeat on the next poll before it replaces the level. One bad gamma quote
 # otherwise becomes the wall for a single minute and then snaps back.
 LEVEL_JUMP = 1.01
-LEVEL_CONFIRM = 3
+LEVEL_CONFIRM = 2
 
 
 @dataclass
@@ -657,6 +667,62 @@ def zero_gamma_level(
     if spot is None or not np.isfinite(spot):
         return float(found[0])
     return float(found[int(np.argmin(np.abs(found - spot)))])
+
+
+def classify_aggressor(price: float, bid: float, ask: float, prev_price: float) -> int:
+    """Lee-Ready side. +1 bought the offer, -1 sold the bid, 0 is unclassified."""
+    if not math.isfinite(price) or price <= 0:
+        return 0
+    if math.isfinite(bid) and math.isfinite(ask) and ask > bid > 0:
+        mid = (bid + ask) / 2.0
+        if price > mid:
+            return 1
+        if price < mid:
+            return -1
+    if math.isfinite(prev_price) and prev_price > 0:
+        if price > prev_price:
+            return 1
+        if price < prev_price:
+            return -1
+    return 0
+
+
+def classified_flow_update(
+    chain: pd.DataFrame,
+    previous: dict[str, float] | None,
+) -> tuple[float, dict[str, float]]:
+    """Share-delta added since the previous chain, signed by the latest sale.
+
+    The first chain only sets the volume baseline. A print at the midpoint
+    with no tick adds nothing, so unclassified volume is not treated as buying.
+    """
+    baseline: dict[str, float] = {}
+    added = 0.0
+    if chain is None or chain.empty:
+        return 0.0, dict(previous or {})
+    for row in chain.itertuples(index=False):
+        strike = float(getattr(row, "strikePrice"))
+        for right in ("call", "put"):
+            volume = float(getattr(row, f"{right}_volume", 0.0) or 0.0)
+            delta = float(getattr(row, f"{right}_delta", 0.0) or 0.0)
+            last = float(getattr(row, f"{right}_last", 0.0) or 0.0)
+            bid = float(getattr(row, f"{right}_bid", 0.0) or 0.0)
+            ask = float(getattr(row, f"{right}_ask", 0.0) or 0.0)
+            volume_key = f"{strike:.2f}:{right}:v"
+            price_key = f"{strike:.2f}:{right}:p"
+            baseline[volume_key] = volume
+            baseline[price_key] = last
+            if previous is None or volume_key not in previous:
+                continue
+            growth = volume - float(previous[volume_key])
+            if growth <= 0:
+                continue
+            side = classify_aggressor(last, bid, ask, float(previous.get(price_key, 0.0)))
+            if side == 0:
+                continue
+            signed_delta = delta if right == "call" else -abs(delta)
+            added += side * growth * signed_delta
+    return added, baseline
 
 
 def cumulative_delta_flow(

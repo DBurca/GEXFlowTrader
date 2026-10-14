@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import math
 import os
+import threading
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -87,6 +88,7 @@ class SchwabSession:
         if stored:
             self.refresh_token = stored
         self.http = requests.Session()
+        self._auth_lock = threading.Lock()
 
     def _authenticate(self) -> None:
         if self.access_token and time.time() < self.token_expiry:
@@ -122,15 +124,20 @@ class SchwabSession:
             _write_refresh_token(self.refresh_token_path, self.refresh_token)
         self.token_expiry = time.time() + TOKEN_AGE_SECONDS
 
+    def _token(self) -> str:
+        with self._auth_lock:
+            self._authenticate()
+            return str(self.access_token)
+
     def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
-        self._authenticate()
+        token = self._token()
         url = f"{MARKET_BASE}{path}"
         last_error: Exception | None = None
         for attempt in range(1, 4):
             try:
-                response = self.http.get(
+                response = requests.get(
                     url,
-                    headers={"Authorization": f"Bearer {self.access_token}", "Accept": "application/json"},
+                    headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
                     params=params,
                     timeout=45,
                 )
@@ -139,8 +146,10 @@ class SchwabSession:
                 time.sleep(attempt)
                 continue
             if response.status_code == 401 and attempt == 1:
-                self.token_expiry = 0.0
-                self._authenticate()
+                with self._auth_lock:
+                    self.token_expiry = 0.0
+                    self._authenticate()
+                    token = str(self.access_token)
                 continue
             if response.status_code in {429, 500, 502, 503, 504} and attempt < 3:
                 time.sleep(attempt)
@@ -404,6 +413,7 @@ def _rows_to_frame(rows: list[tuple[date, int | None, dict[str, Any]]]) -> pd.Da
         slot[f"{right}_volume"] = _number(contract.get("totalVolume"))
         slot[f"{right}_bid"] = _number(contract.get("bid"))
         slot[f"{right}_ask"] = _number(contract.get("ask"))
+        slot[f"{right}_last"] = _number(contract.get("last") or contract.get("lastPrice"))
     if not per_strike:
         return _empty_chain()
     frame = pd.DataFrame(
@@ -418,7 +428,7 @@ def _rows_to_frame(rows: list[tuple[date, int | None, dict[str, Any]]]) -> pd.Da
 def _empty_chain() -> pd.DataFrame:
     columns = ["strikePrice"]
     for right in ("call", "put"):
-        for field in ("openInterest", "gamma", "delta", "volatility", "volume", "bid", "ask"):
+        for field in ("openInterest", "gamma", "delta", "volatility", "volume", "bid", "ask", "last"):
             columns.append(f"{right}_{field}")
     return pd.DataFrame(columns=columns)
 

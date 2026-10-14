@@ -711,9 +711,14 @@ def test_level_spikes_are_held() -> None:
     assert state.accepted == 777
 
     state = LevelState()
-    for reading in (778, 775, 775, 778):
+    for reading in (778, 775, 778):
         state = stabilize_level(reading, state)
     assert state.accepted == 778
+
+    state = LevelState()
+    for reading in (778, 775, 775):
+        state = stabilize_level(reading, state)
+    assert state.accepted == 775
 
     state = LevelState()
     for reading in (780, 777, 777, 777):
@@ -826,6 +831,54 @@ def test_open_levels_peak_and_fear() -> None:
         reloaded.shutdown()
 
 
+def test_audit_risk_fixes() -> None:
+    from datetime import datetime as clock
+    from gex_engine import (
+        classify_aggressor,
+        classified_flow_update,
+        positioning_weight,
+        positioning_weights,
+    )
+    from live_signals import Leg, exit_slippage_factor, intrabar_stop
+
+    open_oi, open_vol = positioning_weights(clock(2026, 10, 14, 9, 30, tzinfo=EASTERN))
+    assert open_oi == 1.0 and open_vol == 0.0
+    before = positioning_weights(clock(2026, 10, 14, 10, 29, tzinfo=EASTERN))
+    after = positioning_weights(clock(2026, 10, 14, 10, 31, tzinfo=EASTERN))
+    assert abs((after[1] - before[1]) - (before[1] - positioning_weights(clock(2026, 10, 14, 10, 27, tzinfo=EASTERN))[1])) < 0.02
+    blended = positioning_weight([100.0], [50.0], clock(2026, 10, 14, 10, 30, tzinfo=EASTERN))
+    assert blended[0] > 40 and blended[0] < 100
+
+    assert classify_aggressor(1.20, 1.00, 1.10, 1.00) == 1
+    assert classify_aggressor(1.00, 1.00, 1.10, 1.20) == -1
+    assert classify_aggressor(1.05, 1.00, 1.10, 1.05) == 0
+
+    chain = pd.DataFrame({
+        "strikePrice": [100.0],
+        "call_volume": [10.0],
+        "call_delta": [0.5],
+        "call_last": [1.20],
+        "call_bid": [1.00],
+        "call_ask": [1.10],
+        "put_volume": [8.0],
+        "put_delta": [-0.4],
+        "put_last": [0.90],
+        "put_bid": [0.80],
+        "put_ask": [1.00],
+    })
+    added, baseline = classified_flow_update(chain, None)
+    assert added == 0.0
+    chain.loc[0, "call_volume"] = 15.0
+    added, _next = classified_flow_update(chain, baseline)
+    assert abs(added - 5.0 * 0.5) < 1e-9
+
+    legs = [Leg("put", 100, "short"), Leg("put", 98, "long")]
+    assert intrabar_stop("bullish", 99.0, 100.0, 0.80, 1.20, 1, legs) == "spot through the structural stop"
+    assert exit_slippage_factor("cascade", "OPEN", 0.35) == 1.0
+    assert exit_slippage_factor("absorption", "STOP", 0.35) == 1.0
+    assert exit_slippage_factor("absorption", "OPEN", 0.35) == 0.35
+
+
 def test_price_history_redraws_the_session() -> None:
     os.environ.setdefault("SCHWAB_APP_KEY", "test-key")
     os.environ.setdefault("SCHWAB_APP_SECRET", "test-secret")
@@ -880,4 +933,5 @@ if __name__ == "__main__":
     test_momentum_and_skew_guards()
     test_open_levels_peak_and_fear()
     test_price_history_redraws_the_session()
+    test_audit_risk_fixes()
     print("forward logic checks passed")

@@ -16,7 +16,8 @@ import os
 import signal
 import sys
 import time
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -37,6 +38,7 @@ from gex_engine import (
     calculate_strike_gex,
     calculate_total_net_gex,
     classify_regime,
+    classified_flow_update,
     iv_max_fear_levels,
     iv_peak_center,
     momentum_features,
@@ -51,7 +53,6 @@ from live_market import (
     SchwabSession,
     fetch_intraday_chain,
     fetch_macro_book,
-    fetch_momentum_bars,
     fetch_near_term_gex,
     session_bars,
 )
@@ -59,7 +60,6 @@ from live_signals import (
     EntrySignal,
     Leg,
     absorption_signal,
-    breach_confirmed,
     cascade_signal,
     cdf_flattened,
     charm_pin_active,
@@ -83,7 +83,9 @@ from live_signals import (
     completed_fifteen_minute_closes,
     completed_five_minute,
     executed_fill,
+    exit_slippage_factor,
     fill_price_blocks,
+    intrabar_stop,
     five_minute_bars,
     macro_entry_window,
     value_at_or_before,
@@ -102,7 +104,8 @@ SYMBOL = "SPY"
 STRATEGIES = ("absorption", "cascade", "macro")
 POLL_SECONDS = 60
 MACRO_REFRESH_SECONDS = 15 * 60
-HMM_REFRESH_SECONDS = 30 * 60
+HMM_REFRESH_SECONDS = 5 * 60
+QUOTE_SKEW_WARN_SECONDS = 3.0
 FEE_PER_CONTRACT = 0.65
 RISK_FRACTION = 0.02
 OPEN_COLOR = 31487
@@ -218,6 +221,10 @@ class ForwardTester:
         self._zero_gamma_state = LevelState()
         self._cdf_flat_streak = 0
         self._es_fallback_logged = False
+        self.last_snap: MarketSnapshot | None = None
+        self._flow_day: str | None = None
+        self._flow_state: dict[str, float] | None = None
+        self.classified_cdf = 0.0
         self.static_open_day: str | None = None
         self.static_open_call_wall: float | None = None
         self.static_open_put_wall: float | None = None
@@ -360,6 +367,14 @@ class ForwardTester:
         self.static_open_call_wall = _optional_float(saved.get("static_open_call_wall_1"))
         self.static_open_put_wall = _optional_float(saved.get("static_open_put_wall_1"))
         self.static_open_pml = _optional_float(saved.get("static_open_pml"))
+        self._flow_day = saved.get("flow_day") or None
+        self.classified_cdf = _optional_float(saved.get("flow_total")) or 0.0
+        raw_flow = saved.get("flow_state") or ""
+        try:
+            loaded = json.loads(raw_flow) if raw_flow else None
+        except json.JSONDecodeError:
+            loaded = None
+        self._flow_state = loaded if isinstance(loaded, dict) else None
 
         start = now_eastern().replace(hour=9, minute=30, second=0, microsecond=0)
         try:
@@ -408,6 +423,7 @@ class ForwardTester:
         except Exception:
             self._restore(checkpoint)
             raise
+        self.last_snap = snap
         self._remember_flow(snap)
         self._publish_view()
         logging.info(
@@ -506,15 +522,46 @@ class ForwardTester:
             "none" if self.static_open_pml is None else f"{self.static_open_pml:.2f}",
         )
 
+    def _fetch_market(self, now: datetime):
+        """Spot, SPY bars, the 0DTE chain, and /ES bars at the same time."""
+        close_at = session_close_time(now.date())
+
+        def timed(fn):
+            try:
+                return fn(), None, time.time()
+            except Exception as exc:
+                return None, exc, time.time()
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            spot_f = pool.submit(timed, lambda: self.client.spot(SYMBOL))
+            bars_f = pool.submit(timed, lambda: self.client.minute_bars(SYMBOL))
+            chain_f = pool.submit(timed, lambda: fetch_intraday_chain(self.client, SYMBOL, now.date()))
+            es_f = pool.submit(timed, lambda: self.client.minute_bars("/ES"))
+            spot, spot_error, spot_at = spot_f.result()
+            raw_bars, bars_error, bars_at = bars_f.result()
+            chain, chain_error, chain_at = chain_f.result()
+            es_raw, es_error, es_at = es_f.result()
+        for error in (spot_error, bars_error, chain_error):
+            if error is not None:
+                raise error
+        skew = max(spot_at, bars_at, chain_at, es_at) - min(spot_at, bars_at, chain_at, es_at)
+        if skew > QUOTE_SKEW_WARN_SECONDS:
+            logging.warning("Quote time skew %.1fs across spot, bars, and the chain", skew)
+        return spot, raw_bars, chain, es_raw, es_error, close_at
+
     def _collect(self) -> MarketSnapshot:
         now = now_eastern()
-        spot = self.client.spot(SYMBOL)
-        raw_bars = self.client.minute_bars(SYMBOL)
-        bars = session_bars(raw_bars, now.date(), session_close_time(now.date()))
+        spot, raw_bars, chain, es_raw, es_error, close_at = self._fetch_market(now)
+        bars = session_bars(raw_bars, now.date(), close_at)
         bands = calculate_vwap_bands(bars)
         latest = bands.iloc[-1]
-        chain = fetch_intraday_chain(self.client, SYMBOL, now.date())
-        intrad = build_intraday_snapshot(chain, spot, now)
+        if self._flow_day != now.date().isoformat():
+            self._flow_day = now.date().isoformat()
+            self._flow_state = None
+            self.classified_cdf = 0.0
+        added, self._flow_state = classified_flow_update(chain, self._flow_state)
+        self.classified_cdf += added
+        intrad = replace(build_intraday_snapshot(chain, spot, now), cdf=self.classified_cdf)
         self._lock_open_levels(now, intrad.call_wall, intrad.put_wall, chain)
         peak = iv_peak_center(chain)
         fear_upper, fear_lower = iv_max_fear_levels(chain, spot)
@@ -527,7 +574,7 @@ class ForwardTester:
             intrad.call_wall_2,
             intrad.put_wall_2,
         )
-        minutes_left = minutes_remaining(now, session_close_time(now.date()))
+        minutes_left = minutes_remaining(now, close_at)
         upper_1, lower_1, upper_2, lower_2 = expected_move_bands(
             float(latest["vwap"]),
             spot,
@@ -536,9 +583,14 @@ class ForwardTester:
             call_iv=intrad.atm_call_iv,
             put_iv=intrad.atm_put_iv,
         )
-        momentum_bars, momentum_source = fetch_momentum_bars(
-            self.client, now.date(), session_close_time(now.date()), bars
-        )
+        momentum_bars, momentum_source = bars, "SPY"
+        if es_error is None and es_raw is not None:
+            try:
+                filtered = session_bars(es_raw, now.date(), close_at)
+            except (TypeError, ValueError, KeyError):
+                filtered = None
+            if filtered is not None and not filtered.empty:
+                momentum_bars, momentum_source = filtered, "/ES"
         if momentum_source != "/ES" and not self._es_fallback_logged:
             logging.info("ES minute bars unavailable; momentum filter is using SPY closes")
             self._es_fallback_logged = True
@@ -627,7 +679,19 @@ class ForwardTester:
         return MACRO_REFRESH_SECONDS
 
     def _hmm(self, closes: pd.Series) -> int | None:
-        if self.hmm is not None and time.monotonic() - self.hmm_fitted_at < HMM_REFRESH_SECONDS:
+        values = closes.to_numpy(dtype=float)
+        shock = (
+            values.size >= 2
+            and math.isfinite(values[-1])
+            and math.isfinite(values[-2])
+            and values[-2] != 0
+            and abs(values[-1] / values[-2] - 1.0) >= 0.003
+        )
+        if (
+            not shock
+            and self.hmm is not None
+            and time.monotonic() - self.hmm_fitted_at < HMM_REFRESH_SECONDS
+        ):
             return self.hmm
         fitted = infer_hmm_state(closes.to_numpy(dtype=float))
         if fitted is None and self.hmm is not None:
@@ -683,44 +747,23 @@ class ForwardTester:
         close_at = session_close_time(snap.now.date())
         if minutes_before_close(snap.now, close_at, 5):
             return self._close_position(name, snap, "MARKET_FLATTEN", "session flatten", allow_intrinsic=True)
-        bar = self._latest_bar(snap)
-        if bar is not None and bar[0] > position["entry_bar"]:
-            if name == "absorption" and self._absorption_stopped(position, snap, bar[1]):
-                return self._close_position(
-                    name, snap, "STOP", "5-minute close through the tested level with CDF confirmation",
-                    allow_intrinsic=True,
-                )
-            if name == "cascade" and self._cascade_stopped(position, snap, bar[1]):
-                return self._close_position(
-                    name, snap, "STOP", "5-minute close back through zero gamma",
-                    allow_intrinsic=True,
-                )
+        stop_level = snap.zero_gamma if name == "cascade" else float(position.get("stop") or position["anchor"])
+        marked = self._exit_mark(position, snap, "STOP")
+        risk = intrabar_stop(
+            position["direction"],
+            snap.spot,
+            stop_level,
+            float(position["entry_net"]),
+            marked,
+            int(position["contracts"]),
+            position["legs"],
+        )
+        if risk is not None:
+            return self._close_position(name, snap, "STOP", risk, allow_intrinsic=True)
         reason = self._profit_reason(name, position, snap)
         if reason is None or not self._exit_is_profitable(name, snap):
             return None
         return self._close_position(name, snap, "TAKE_PROFIT", reason, allow_intrinsic=False)
-
-    def _absorption_stopped(self, position: dict[str, Any], snap: MarketSnapshot, bar: pd.Series) -> bool:
-        if snap.cdf is None:
-            return False
-        previous = value_at_or_before(self.cdf_history, snap.now - timedelta(minutes=15))
-        if previous is None:
-            return False
-        return breach_confirmed(
-            position["direction"],
-            float(bar["Close"]),
-            float(position.get("stop") or position["anchor"]),
-            snap.cdf,
-            previous,
-        )
-
-    def _cascade_stopped(self, position: dict[str, Any], snap: MarketSnapshot, bar: pd.Series) -> bool:
-        if snap.zero_gamma is None:
-            return False
-        close = float(bar["Close"])
-        if position["direction"] == "bullish":
-            return close <= snap.zero_gamma
-        return close >= snap.zero_gamma
 
     def _profit_reason(self, name: str, position: dict[str, Any], snap: MarketSnapshot) -> str | None:
         marked = self._marked_net(position, snap.chain)
@@ -756,13 +799,28 @@ class ForwardTester:
             return "cumulative delta flow flattened"
         return None
 
-    def _priced(self, chain: pd.DataFrame, legs: list[Leg], closing: bool) -> tuple[float, float] | None:
+    def _exit_mark(self, position: dict[str, Any], snap: MarketSnapshot, event: str) -> float | None:
+        chain = snap.macro_chain if position["strategy"] == "macro" else snap.chain
+        priced = self._priced(chain, position["legs"], closing=True, event=event, strategy=position["strategy"])
+        if priced is None:
+            return None
+        return priced[1]
+
+    def _priced(
+        self,
+        chain: pd.DataFrame,
+        legs: list[Leg],
+        closing: bool,
+        event: str = "TAKE_PROFIT",
+        strategy: str = "absorption",
+    ) -> tuple[float, float] | None:
         """Signed mid and the fill. Closing adds the spread back; opening subtracts it."""
         nets = structure_nets(chain, legs)
         if nets is None:
             return None
         mid, width = nets
-        slip = self.slippage_factor * width
+        factor = exit_slippage_factor(strategy, "OPEN" if not closing else event, self.slippage_factor)
+        slip = factor * width
         return mid, mid + slip if closing else mid - slip
 
     def _exit_is_profitable(self, name: str, snap: MarketSnapshot) -> bool:
@@ -939,7 +997,7 @@ class ForwardTester:
         if nets is None:
             return None
         signed, width = nets
-        fill = executed_fill(signed, width, self.slippage_factor)
+        fill = executed_fill(signed, width, exit_slippage_factor(signal.strategy, "OPEN", self.slippage_factor))
         rejected = fill_price_blocks(signed, fill, legs)
         if rejected:
             logging.info("%s blocked by fill: %s", signal.strategy, rejected)
@@ -994,7 +1052,7 @@ class ForwardTester:
     ) -> dict[str, Any] | None:
         position = self.positions[name]
         chain = snap.macro_chain if name == "macro" else snap.chain
-        priced = self._priced(chain, position["legs"], closing=True)
+        priced = self._priced(chain, position["legs"], closing=True, event=event, strategy=name)
         used_intrinsic = False
         if priced is None and allow_intrinsic:
             intrinsic = _intrinsic_net(position["legs"], snap.spot)
@@ -1208,6 +1266,9 @@ class ForwardTester:
                 "static_open_call_wall_1": "" if self.static_open_call_wall is None else str(self.static_open_call_wall),
                 "static_open_put_wall_1": "" if self.static_open_put_wall is None else str(self.static_open_put_wall),
                 "static_open_pml": "" if self.static_open_pml is None else str(self.static_open_pml),
+                "flow_day": self._flow_day or "",
+                "flow_total": str(self.classified_cdf),
+                "flow_state": json.dumps(self._flow_state or {}),
             }
             for name in STRATEGIES:
                 until = self.cooldowns.get(name)
@@ -1336,8 +1397,10 @@ class ForwardTester:
             logging.error("Discord webhook failed: %s", exc.__class__.__name__)
 
     def _pause_on_error(self, exc: Exception, everyone: bool) -> None:
+        self._flatten_if_unmanaged()
         wait = self.backoff
-        self.backoff = min(self.backoff * 2, 300)
+        cap = 30 if any(name in self.positions for name in ("absorption", "cascade")) else 300
+        self.backoff = min(self.backoff * 2, cap)
         reason = " ".join(f"{exc.__class__.__name__}: {exc}".split())[:300]
         message = (
             f"SPY forward test paused: {reason}. Next retry in {wait}s. "
@@ -1348,6 +1411,35 @@ class ForwardTester:
         logging.error(message)
         self._discord_text(message)
         time.sleep(wait)
+
+    def _flatten_if_unmanaged(self) -> None:
+        """Paper-flatten 0DTE positions when a failed poll lands inside the last 10 minutes."""
+        snap = self.last_snap
+        if snap is None:
+            return
+        now = now_eastern()
+        if not minutes_before_close(now, session_close_time(now.date()), 10):
+            return
+        if not any(name in self.positions for name in ("absorption", "cascade")):
+            return
+        snap.now = now
+        events = []
+        for name in ("absorption", "cascade"):
+            if name not in self.positions:
+                continue
+            closed = self._close_position(
+                name, snap, "MARKET_FLATTEN", "poll outage inside the flatten window", allow_intrinsic=True,
+            )
+            if closed is not None:
+                events.append(closed)
+                self._discord_event(snap, closed)
+        if not events:
+            return
+        try:
+            self._persist(snap, events)
+            self._publish_view()
+        except Exception:
+            logging.exception("Outage flatten could not be stored")
 
     def _sleep_until_open(self) -> None:
         nxt = next_session_open()
