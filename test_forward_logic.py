@@ -834,12 +834,14 @@ def test_open_levels_peak_and_fear() -> None:
 def test_audit_risk_fixes() -> None:
     from datetime import datetime as clock
     from gex_engine import (
+        bulk_volume_factor,
         classify_aggressor,
         classified_flow_update,
         positioning_weight,
         positioning_weights,
     )
-    from live_signals import Leg, exit_slippage_factor, intrabar_stop
+    from live_market import underlying_spot
+    from live_signals import Leg, dynamic_slippage_factor, exit_slippage_factor, intrabar_stop
 
     open_oi, open_vol = positioning_weights(clock(2026, 10, 14, 9, 30, tzinfo=EASTERN))
     assert open_oi == 1.0 and open_vol == 0.0
@@ -857,7 +859,7 @@ def test_audit_risk_fixes() -> None:
         "strikePrice": [100.0],
         "call_volume": [10.0],
         "call_delta": [0.5],
-        "call_last": [1.20],
+        "call_last": [1.00],
         "call_bid": [1.00],
         "call_ask": [1.10],
         "put_volume": [8.0],
@@ -869,14 +871,19 @@ def test_audit_risk_fixes() -> None:
     added, baseline = classified_flow_update(chain, None)
     assert added == 0.0
     chain.loc[0, "call_volume"] = 15.0
-    added, _next = classified_flow_update(chain, baseline)
+    chain.loc[0, "call_last"] = 1.05
+    added, _next = classified_flow_update(chain, baseline, spot_drift=0.1)
     assert abs(added - 5.0 * 0.5) < 1e-9
+    assert bulk_volume_factor(0.0, 1.0, 1.0, -0.2) == -1.0
+    assert underlying_spot({"underlyingPrice": 501.25}) == 501.25
 
     legs = [Leg("put", 100, "short"), Leg("put", 98, "long")]
     assert intrabar_stop("bullish", 99.0, 100.0, 0.80, 1.20, 1, legs) == "spot through the structural stop"
     assert exit_slippage_factor("cascade", "OPEN", 0.35) == 1.0
     assert exit_slippage_factor("absorption", "STOP", 0.35) == 1.0
     assert exit_slippage_factor("absorption", "OPEN", 0.35) == 0.35
+    assert dynamic_slippage_factor(0.08, 0.04) == 0.50
+    assert abs(exit_slippage_factor("absorption", "TAKE_PROFIT", 0.35, 0.06, 0.04) - 0.425) < 1e-9
 
 
 def test_price_history_redraws_the_session() -> None:

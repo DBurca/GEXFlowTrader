@@ -687,14 +687,33 @@ def classify_aggressor(price: float, bid: float, ask: float, prev_price: float) 
     return 0
 
 
+def bulk_volume_factor(price_change: float, bid: float, ask: float, spot_drift: float) -> float:
+    """Fraction of the interval's volume treated as buying. Clipped to [-1, 1].
+
+    A REST snapshot has no tape, so the move of the last sale across the
+    half-spread stands in for the aggressor. A locked quote falls back to
+    the sign of the spot change.
+    """
+    if math.isfinite(bid) and math.isfinite(ask) and ask > bid and math.isfinite(price_change):
+        half = (ask - bid) / 2.0
+        if half > 0:
+            return float(np.clip(price_change / half, -1.0, 1.0))
+    if spot_drift > 0:
+        return 1.0
+    if spot_drift < 0:
+        return -1.0
+    return 0.0
+
+
 def classified_flow_update(
     chain: pd.DataFrame,
     previous: dict[str, float] | None,
+    spot_drift: float = 0.0,
 ) -> tuple[float, dict[str, float]]:
-    """Share-delta added since the previous chain, signed by the latest sale.
+    """Share-delta added since the previous chain, weighted by bulk volume classification.
 
-    The first chain only sets the volume baseline. A print at the midpoint
-    with no tick adds nothing, so unclassified volume is not treated as buying.
+    The first chain only sets the volume baseline. Later polls count the
+    volume increase times signed delta times the aggressor fraction.
     """
     baseline: dict[str, float] = {}
     added = 0.0
@@ -717,11 +736,11 @@ def classified_flow_update(
             growth = volume - float(previous[volume_key])
             if growth <= 0:
                 continue
-            side = classify_aggressor(last, bid, ask, float(previous.get(price_key, 0.0)))
-            if side == 0:
+            factor = bulk_volume_factor(last - float(previous.get(price_key, last)), bid, ask, spot_drift)
+            if factor == 0.0:
                 continue
             signed_delta = delta if right == "call" else -abs(delta)
-            added += side * growth * signed_delta
+            added += factor * growth * signed_delta
     return added, baseline
 
 

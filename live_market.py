@@ -26,6 +26,9 @@ from event_calendar import EASTERN
 MARKET_BASE = "https://api.schwabapi.com/marketdata/v1"
 TOKEN_URL = "https://api.schwabapi.com/v1/oauth/token"
 TOKEN_AGE_SECONDS = 28 * 60
+# A burst of four covers one parallel poll. Refill stays at 90/min, under the 120 cap.
+REQUESTS_PER_SECOND = 1.5
+REQUEST_BURST = 4.0
 
 
 def _refresh_token_path():
@@ -89,6 +92,9 @@ class SchwabSession:
             self.refresh_token = stored
         self.http = requests.Session()
         self._auth_lock = threading.Lock()
+        self._pace_lock = threading.Lock()
+        self._bucket = REQUEST_BURST
+        self._bucket_at = time.monotonic()
 
     def _authenticate(self) -> None:
         if self.access_token and time.time() < self.token_expiry:
@@ -129,17 +135,30 @@ class SchwabSession:
             self._authenticate()
             return str(self.access_token)
 
+    def _pace(self) -> None:
+        while True:
+            with self._pace_lock:
+                now = time.monotonic()
+                self._bucket = min(REQUEST_BURST, self._bucket + (now - self._bucket_at) * REQUESTS_PER_SECOND)
+                self._bucket_at = now
+                if self._bucket >= 1.0:
+                    self._bucket -= 1.0
+                    return
+                wait = (1.0 - self._bucket) / REQUESTS_PER_SECOND
+            time.sleep(wait)
+
     def _get(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
         token = self._token()
         url = f"{MARKET_BASE}{path}"
         last_error: Exception | None = None
         for attempt in range(1, 4):
+            self._pace()
             try:
                 response = requests.get(
                     url,
                     headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
                     params=params,
-                    timeout=45,
+                    timeout=20,
                 )
             except RequestException as exc:
                 last_error = exc
@@ -151,7 +170,15 @@ class SchwabSession:
                     self._authenticate()
                     token = str(self.access_token)
                 continue
-            if response.status_code in {429, 500, 502, 503, 504} and attempt < 3:
+            if response.status_code == 429 and attempt < 3:
+                retry = response.headers.get("Retry-After")
+                try:
+                    delay = float(retry) if retry else float(attempt)
+                except ValueError:
+                    delay = float(attempt)
+                time.sleep(min(30.0, delay))
+                continue
+            if response.status_code in {500, 502, 503, 504} and attempt < 3:
                 time.sleep(attempt)
                 continue
             if response.status_code != 200:
@@ -302,7 +329,27 @@ def fetch_near_term_gex(client: SchwabSession, symbol: str, session_day: date, s
     return total
 
 
-def fetch_intraday_chain(client: SchwabSession, symbol: str, session_day: date) -> pd.DataFrame:
+def underlying_spot(payload: dict[str, Any]) -> float:
+    """Spot printed on the chain, so the book and the price share one response."""
+    direct = _number(payload.get("underlyingPrice"))
+    if direct > 0:
+        return direct
+    underlying = payload.get("underlying")
+    if not isinstance(underlying, dict):
+        return 0.0
+    for key in ("last", "mark"):
+        value = _number(underlying.get(key))
+        if value > 0:
+            return value
+    quote = underlying.get("quote") if isinstance(underlying.get("quote"), dict) else {}
+    for key in ("lastPrice", "mark", "last"):
+        value = _number(quote.get(key))
+        if value > 0:
+            return value
+    return 0.0
+
+
+def fetch_intraday_chain(client: SchwabSession, symbol: str, session_day: date) -> tuple[pd.DataFrame, float]:
     payload = client.option_chain(
         symbol,
         start=session_day,
@@ -312,7 +359,10 @@ def fetch_intraday_chain(client: SchwabSession, symbol: str, session_day: date) 
     frame = _chain_frame(payload, lambda dte, exp: exp == session_day and dte == 0)
     if frame.empty:
         raise MarketDataError(f"no 0DTE contracts for {session_day.isoformat()}")
-    return frame
+    spot = underlying_spot(payload)
+    if spot <= 0:
+        spot = client.spot(symbol)
+    return frame, spot
 
 
 def fetch_macro_book(client: SchwabSession, symbol: str, session_day: date) -> MacroBook:

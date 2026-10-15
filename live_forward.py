@@ -2,9 +2,11 @@
 SPY paper forward test.
 
 Three strategy accounts plus a cumulative balance. No broker orders.
-Snapshots and trades commit together; a failed poll stores nothing and
-does not change a paper position. Errors back off in-process and notify
-Discord. Weekends and NYSE holidays wait for the next open.
+The 0DTE chain is read every few seconds and already includes spot.
+Quiet polls keep the risk state in memory and commit the journal once
+a minute. A trade commits immediately. A failed poll stores nothing
+new and does not change a paper position. Errors back off in-process
+and notify Discord. Weekends and NYSE holidays wait for the next open.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ import math
 import os
 import signal
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -50,6 +53,7 @@ from gex_engine import (
 from live_market import (
     AuthError,
     MacroBook,
+    MarketDataError,
     SchwabSession,
     fetch_intraday_chain,
     fetch_macro_book,
@@ -102,10 +106,15 @@ logging.basicConfig(
 
 SYMBOL = "SPY"
 STRATEGIES = ("absorption", "cascade", "macro")
-POLL_SECONDS = 60
+# One 0DTE chain carries spot. A 1 Hz loop would stack behind that payload.
+CHAIN_SECONDS = 5
+BARS_SECONDS = 60
+ES_SECONDS = 15
+NEAR_SECONDS = 60
+JOURNAL_SECONDS = 60
 MACRO_REFRESH_SECONDS = 15 * 60
 HMM_REFRESH_SECONDS = 5 * 60
-QUOTE_SKEW_WARN_SECONDS = 3.0
+STALE_SECONDS = 90
 FEE_PER_CONTRACT = 0.65
 RISK_FRACTION = 0.02
 OPEN_COLOR = 31487
@@ -225,6 +234,20 @@ class ForwardTester:
         self._flow_day: str | None = None
         self._flow_state: dict[str, float] | None = None
         self.classified_cdf = 0.0
+        self._prev_spot: float | None = None
+        self._quote_baseline: float | None = None
+        self._cached_bars: pd.DataFrame | None = None
+        self._bars_at = 0.0
+        self._cached_es: pd.DataFrame | None = None
+        self._es_at = 0.0
+        self._es_error: Exception | None = None
+        self._cached_near: float | None = None
+        self._near_at = 0.0
+        self._journal_at = 0.0
+        self._cdf_sample_at: datetime | None = None
+        self._heartbeat = time.monotonic()
+        self._force_flatten = False
+        self._stop_watch = threading.Event()
         self.static_open_day: str | None = None
         self.static_open_call_wall: float | None = None
         self.static_open_put_wall: float | None = None
@@ -392,6 +415,8 @@ class ForwardTester:
                 self.iv_history.append((moment, float(iv)))
 
     def run(self) -> None:
+        self._heartbeat = time.monotonic()
+        threading.Thread(target=self._watch_heartbeat, name="risk-watch", daemon=True).start()
         self._publish_view()
         self._discord_text(
             "SPY forward test started. Paper only. "
@@ -400,14 +425,15 @@ class ForwardTester:
         while True:
             try:
                 if not in_regular_session():
+                    self._heartbeat = time.monotonic()
                     self._sleep_until_open()
                     continue
                 started = time.monotonic()
                 self._iteration()
                 self.backoff = 15
-                remaining = POLL_SECONDS - (time.monotonic() - started)
+                remaining = CHAIN_SECONDS - (time.monotonic() - started)
                 if remaining > 0:
-                    time.sleep(remaining)
+                    self._sleep(remaining)
             except AuthError as exc:
                 self._pause_on_error(exc, everyone=True)
             except Exception as exc:
@@ -415,17 +441,28 @@ class ForwardTester:
                 self._pause_on_error(exc, everyone=False)
 
     def _iteration(self) -> None:
+        self._heartbeat = time.monotonic()
+        if self._force_flatten:
+            self._force_flatten = False
+            self._flatten_if_unmanaged(force=True)
         snap = self._collect()
+        self._heartbeat = time.monotonic()
+        self._force_flatten = False
         checkpoint = self._checkpoint()
         try:
             events = self._decide(snap)
-            self._persist(snap, events)
+            journal = bool(events) or time.monotonic() - self._journal_at >= JOURNAL_SECONDS
+            if journal:
+                self._persist(snap, events)
+                self._journal_at = time.monotonic()
         except Exception:
             self._restore(checkpoint)
             raise
         self.last_snap = snap
         self._remember_flow(snap)
-        self._publish_view()
+        if journal:
+            self._publish_view()
+        self._heartbeat = time.monotonic()
         logging.info(
             "STATE | spot=%.2f | iGEX=%s | mGEX=%s | HMM=%s | OU=%s | blackout=%s | charm=%s | charm$=%s",
             snap.spot,
@@ -523,31 +560,51 @@ class ForwardTester:
         )
 
     def _fetch_market(self, now: datetime):
-        """Spot, SPY bars, the 0DTE chain, and /ES bars at the same time."""
+        """0DTE chain every cycle. Bars, /ES, and the near-term book stay on slower clocks."""
         close_at = session_close_time(now.date())
+        clock = time.monotonic()
+        want_bars = self._cached_bars is None or clock - self._bars_at >= BARS_SECONDS
+        want_es = self._cached_es is None or clock - self._es_at >= ES_SECONDS
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            chain_f = pool.submit(fetch_intraday_chain, self.client, SYMBOL, now.date())
+            bars_f = pool.submit(self.client.minute_bars, SYMBOL) if want_bars else None
+            es_f = pool.submit(self.client.minute_bars, "/ES") if want_es else None
+            chain, spot = chain_f.result()
+            if bars_f is not None:
+                try:
+                    self._cached_bars = bars_f.result()
+                    self._bars_at = time.monotonic()
+                except Exception:
+                    if self._cached_bars is None:
+                        raise
+                    logging.warning("SPY bars failed; keeping the last minute history")
+            if es_f is not None:
+                try:
+                    self._cached_es = es_f.result()
+                    self._es_error = None
+                    self._es_at = time.monotonic()
+                except Exception as exc:
+                    if self._cached_es is None:
+                        self._es_error = exc
+                    else:
+                        logging.warning("ES bars failed; keeping the last futures history")
+        if self._cached_bars is None:
+            raise MarketDataError("no SPY bars")
+        return spot, self._cached_bars, chain, self._cached_es, self._es_error, close_at
 
-        def timed(fn):
-            try:
-                return fn(), None, time.time()
-            except Exception as exc:
-                return None, exc, time.time()
-
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            spot_f = pool.submit(timed, lambda: self.client.spot(SYMBOL))
-            bars_f = pool.submit(timed, lambda: self.client.minute_bars(SYMBOL))
-            chain_f = pool.submit(timed, lambda: fetch_intraday_chain(self.client, SYMBOL, now.date()))
-            es_f = pool.submit(timed, lambda: self.client.minute_bars("/ES"))
-            spot, spot_error, spot_at = spot_f.result()
-            raw_bars, bars_error, bars_at = bars_f.result()
-            chain, chain_error, chain_at = chain_f.result()
-            es_raw, es_error, es_at = es_f.result()
-        for error in (spot_error, bars_error, chain_error):
-            if error is not None:
-                raise error
-        skew = max(spot_at, bars_at, chain_at, es_at) - min(spot_at, bars_at, chain_at, es_at)
-        if skew > QUOTE_SKEW_WARN_SECONDS:
-            logging.warning("Quote time skew %.1fs across spot, bars, and the chain", skew)
-        return spot, raw_bars, chain, es_raw, es_error, close_at
+    def _near_gex(self, now: datetime, spot: float) -> float:
+        if self._cached_near is not None and time.monotonic() - self._near_at < NEAR_SECONDS:
+            return self._cached_near
+        try:
+            value = fetch_near_term_gex(self.client, SYMBOL, now.date(), spot)
+        except MarketDataError:
+            if self._cached_near is None:
+                raise
+            logging.warning("0–1 DTE book failed; keeping the last magnitude")
+            return self._cached_near
+        self._cached_near = value
+        self._near_at = time.monotonic()
+        return value
 
     def _collect(self) -> MarketSnapshot:
         now = now_eastern()
@@ -559,13 +616,16 @@ class ForwardTester:
             self._flow_day = now.date().isoformat()
             self._flow_state = None
             self.classified_cdf = 0.0
-        added, self._flow_state = classified_flow_update(chain, self._flow_state)
+            self._prev_spot = None
+        drift = 0.0 if self._prev_spot is None else spot - self._prev_spot
+        self._prev_spot = spot
+        added, self._flow_state = classified_flow_update(chain, self._flow_state, drift)
         self.classified_cdf += added
         intrad = replace(build_intraday_snapshot(chain, spot, now), cdf=self.classified_cdf)
         self._lock_open_levels(now, intrad.call_wall, intrad.put_wall, chain)
         peak = iv_peak_center(chain)
         fear_upper, fear_lower = iv_max_fear_levels(chain, spot)
-        gex_0_1 = fetch_near_term_gex(self.client, SYMBOL, now.date(), spot)
+        gex_0_1 = self._near_gex(now, spot)
         call_wall, put_wall, zero_gamma, call_wall_2, put_wall_2 = self._stable_levels(
             now,
             intrad.call_wall,
@@ -675,7 +735,7 @@ class ForwardTester:
 
     def _macro_refresh_seconds(self) -> float:
         if "macro" in self.positions:
-            return POLL_SECONDS
+            return float(JOURNAL_SECONDS)
         return MACRO_REFRESH_SECONDS
 
     def _hmm(self, closes: pd.Series) -> int | None:
@@ -794,14 +854,17 @@ class ForwardTester:
             return "spot reached the lower 2σ band"
         previous = value_at_or_before(self.cdf_history, snap.now - timedelta(minutes=15))
         flat = snap.cdf is not None and previous is not None and cdf_flattened(snap.cdf, previous)
-        self._cdf_flat_streak, confirmed = next_cdf_flat_streak(self._cdf_flat_streak, flat)
+        confirmed = self._sample_cdf_flat(flat, snap.now)
         if confirmed and marked is not None:
             return "cumulative delta flow flattened"
         return None
 
     def _exit_mark(self, position: dict[str, Any], snap: MarketSnapshot, event: str) -> float | None:
         chain = snap.macro_chain if position["strategy"] == "macro" else snap.chain
-        priced = self._priced(chain, position["legs"], closing=True, event=event, strategy=position["strategy"])
+        priced = self._priced(
+            chain, position["legs"], closing=True, event=event, strategy=position["strategy"],
+            baseline=position.get("entry_width"),
+        )
         if priced is None:
             return None
         return priced[1]
@@ -813,20 +876,31 @@ class ForwardTester:
         closing: bool,
         event: str = "TAKE_PROFIT",
         strategy: str = "absorption",
+        baseline: float | None = None,
     ) -> tuple[float, float] | None:
         """Signed mid and the fill. Closing adds the spread back; opening subtracts it."""
         nets = structure_nets(chain, legs)
         if nets is None:
             return None
         mid, width = nets
-        factor = exit_slippage_factor(strategy, "OPEN" if not closing else event, self.slippage_factor)
+        if not closing:
+            baseline = self._calm_width(width)
+        factor = exit_slippage_factor(
+            strategy,
+            "OPEN" if not closing else event,
+            self.slippage_factor,
+            width,
+            baseline,
+        )
         slip = factor * width
         return mid, mid + slip if closing else mid - slip
 
     def _exit_is_profitable(self, name: str, snap: MarketSnapshot) -> bool:
         """A take-profit close has to be green after round-trip fees and exit slippage."""
         position = self.positions[name]
-        priced = self._priced(snap.chain, position["legs"], closing=True)
+        priced = self._priced(
+            snap.chain, position["legs"], closing=True, baseline=position.get("entry_width"),
+        )
         if priced is None:
             return False
         fees = round_trip_fees(int(position["contracts"]), len(position["legs"]), FEE_PER_CONTRACT)
@@ -997,7 +1071,11 @@ class ForwardTester:
         if nets is None:
             return None
         signed, width = nets
-        fill = executed_fill(signed, width, exit_slippage_factor(signal.strategy, "OPEN", self.slippage_factor))
+        fill = executed_fill(
+            signed,
+            width,
+            exit_slippage_factor(signal.strategy, "OPEN", self.slippage_factor, width, self._calm_width(width)),
+        )
         rejected = fill_price_blocks(signed, fill, legs)
         if rejected:
             logging.info("%s blocked by fill: %s", signal.strategy, rejected)
@@ -1021,6 +1099,7 @@ class ForwardTester:
             "entry_bar": bar_key,
             "anchor": signal.anchor,
             "stop": signal.stop if signal.stop is not None else signal.anchor,
+            "entry_width": width,
             "reason": signal.reason,
             "expiration": snap.macro_expiration if signal.strategy == "macro" else snap.now.date().isoformat(),
         }
@@ -1052,7 +1131,10 @@ class ForwardTester:
     ) -> dict[str, Any] | None:
         position = self.positions[name]
         chain = snap.macro_chain if name == "macro" else snap.chain
-        priced = self._priced(chain, position["legs"], closing=True, event=event, strategy=name)
+        priced = self._priced(
+            chain, position["legs"], closing=True, event=event, strategy=name,
+            baseline=position.get("entry_width"),
+        )
         used_intrinsic = False
         if priced is None and allow_intrinsic:
             intrinsic = _intrinsic_net(position["legs"], snap.spot)
@@ -1323,6 +1405,7 @@ class ForwardTester:
             "cooldowns": dict(self.cooldowns),
             "last_signal_bar": self.last_signal_bar,
             "cdf_flat_streak": self._cdf_flat_streak,
+            "cdf_sample_at": self._cdf_sample_at.isoformat() if self._cdf_sample_at else None,
             "prior_hmm": self.prior_hmm,
             "closing_hmm": self.closing_hmm,
             "previous_close": self.previous_close,
@@ -1341,6 +1424,8 @@ class ForwardTester:
         self.cooldowns = dict(checkpoint["cooldowns"])
         self.last_signal_bar = checkpoint["last_signal_bar"]
         self._cdf_flat_streak = checkpoint["cdf_flat_streak"]
+        sampled = checkpoint.get("cdf_sample_at")
+        self._cdf_sample_at = datetime.fromisoformat(sampled) if sampled else None
         self.prior_hmm = checkpoint["prior_hmm"]
         self.closing_hmm = checkpoint["closing_hmm"]
         self.previous_close = checkpoint["previous_close"]
@@ -1396,6 +1481,39 @@ class ForwardTester:
         except requests.RequestException as exc:
             logging.error("Discord webhook failed: %s", exc.__class__.__name__)
 
+    def _calm_width(self, width: float) -> float:
+        if self._quote_baseline is None or width < self._quote_baseline:
+            self._quote_baseline = width
+        return float(self._quote_baseline)
+
+    def _sample_cdf_flat(self, flat: bool, now: datetime) -> bool:
+        """One sample a minute, so a 5-second chain poll cannot flatten a cascade in 15 seconds."""
+        if self._cdf_sample_at is not None and (now - self._cdf_sample_at).total_seconds() < 60:
+            return False
+        self._cdf_sample_at = now
+        self._cdf_flat_streak, confirmed = next_cdf_flat_streak(self._cdf_flat_streak, flat)
+        return confirmed
+
+    def _sleep(self, seconds: float) -> None:
+        end = time.monotonic() + max(0.0, seconds)
+        while time.monotonic() < end:
+            if self._force_flatten:
+                self._force_flatten = False
+                self._flatten_if_unmanaged(force=True)
+                return
+            time.sleep(min(1.0, end - time.monotonic()))
+
+    def _watch_heartbeat(self) -> None:
+        while not self._stop_watch.wait(5):
+            age = time.monotonic() - self._heartbeat
+            if age <= STALE_SECONDS:
+                continue
+            if not any(name in self.positions for name in ("absorption", "cascade")):
+                continue
+            if not self._force_flatten:
+                logging.critical("No completed poll for %.0fs with an open 0DTE position", age)
+            self._force_flatten = True
+
     def _pause_on_error(self, exc: Exception, everyone: bool) -> None:
         self._flatten_if_unmanaged()
         wait = self.backoff
@@ -1410,26 +1528,26 @@ class ForwardTester:
             message = "@everyone " + message
         logging.error(message)
         self._discord_text(message)
-        time.sleep(wait)
+        self._sleep(wait)
 
-    def _flatten_if_unmanaged(self) -> None:
-        """Paper-flatten 0DTE positions when a failed poll lands inside the last 10 minutes."""
+    def _flatten_if_unmanaged(self, force: bool = False) -> None:
+        """Paper-flatten 0DTE positions after a stale poll, or a failure inside the last 10 minutes."""
         snap = self.last_snap
         if snap is None:
             return
         now = now_eastern()
-        if not minutes_before_close(now, session_close_time(now.date()), 10):
+        late = minutes_before_close(now, session_close_time(now.date()), 10)
+        if not force and not late:
             return
         if not any(name in self.positions for name in ("absorption", "cascade")):
             return
+        reason = "poll outage inside the flatten window" if late else "no poll for 90 seconds"
         snap.now = now
         events = []
         for name in ("absorption", "cascade"):
             if name not in self.positions:
                 continue
-            closed = self._close_position(
-                name, snap, "MARKET_FLATTEN", "poll outage inside the flatten window", allow_intrinsic=True,
-            )
+            closed = self._close_position(name, snap, "MARKET_FLATTEN", reason, allow_intrinsic=True)
             if closed is not None:
                 events.append(closed)
                 self._discord_event(snap, closed)
@@ -1438,6 +1556,8 @@ class ForwardTester:
         try:
             self._persist(snap, events)
             self._publish_view()
+            self._journal_at = time.monotonic()
+            self._heartbeat = time.monotonic()
         except Exception:
             logging.exception("Outage flatten could not be stored")
 
@@ -1448,6 +1568,7 @@ class ForwardTester:
         time.sleep(seconds)
 
     def shutdown(self) -> None:
+        self._stop_watch.set()
         logging.info("Shutting down forward test.")
         try:
             self.db.close()
@@ -1507,6 +1628,7 @@ def _position_to_json(position: dict[str, Any]) -> str:
         "entry_bar": position["entry_bar"],
         "anchor": position["anchor"],
         "stop": position.get("stop", position["anchor"]),
+        "entry_width": position.get("entry_width"),
         "reason": position["reason"],
         "expiration": position.get("expiration") or "",
     }

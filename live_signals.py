@@ -23,8 +23,8 @@ PIN_FRACTION = 0.0015
 IV_STABLE_PAD = 0.002
 IV_SPIKE = 0.005
 CDF_FLAT_FRACTION = 0.05
-# A one-minute CDF endpoint can look flat after a round trip. Require the
-# same three-poll confirmation the walls use before a flow exit.
+# A one-minute CDF endpoint can look flat after a round trip. The tester
+# samples this once a minute, so three confirms is about three minutes.
 CDF_FLAT_CONFIRM = 3
 
 
@@ -644,11 +644,27 @@ def intrabar_stop(
     return None
 
 
-def exit_slippage_factor(strategy: str, event: str, base: float) -> float:
-    """Cascade entries and panic exits cross the spread. Calm credits keep the base factor."""
+def dynamic_slippage_factor(live_width: float, baseline_width: float | None, base: float = 0.35) -> float:
+    """Widen the calm factor when the live spread is wider than the baseline, up to 0.50."""
+    if baseline_width is None or baseline_width <= 0 or not math.isfinite(live_width):
+        return float(base)
+    expansion = max(0.0, (float(live_width) - float(baseline_width)) / float(baseline_width))
+    return min(0.50, float(base) + 0.15 * expansion)
+
+
+def exit_slippage_factor(
+    strategy: str,
+    event: str,
+    base: float,
+    live_width: float | None = None,
+    baseline_width: float | None = None,
+) -> float:
+    """Cascade entries and panic exits cross the spread. Calm fills scale with spread expansion."""
     if event in {"STOP", "MARKET_FLATTEN"} or (event == "OPEN" and strategy == "cascade"):
         return max(float(base), 1.0)
-    return float(base)
+    if live_width is None or baseline_width is None:
+        return float(base)
+    return dynamic_slippage_factor(live_width, baseline_width, base)
 
 
 def trade_pnl(
@@ -670,7 +686,7 @@ def cdf_flattened(cdf_now: float, cdf_prev: float) -> bool:
 
 
 def next_cdf_flat_streak(streak: int, is_flat: bool) -> tuple[int, bool]:
-    """Advance the consecutive-poll count. The second value is true once it holds."""
+    """Advance the consecutive minute-sample count. The second value is true once it holds."""
     streak = streak + 1 if is_flat else 0
     return streak, streak >= CDF_FLAT_CONFIRM
 

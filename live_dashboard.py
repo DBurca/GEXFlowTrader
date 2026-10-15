@@ -7,6 +7,7 @@ It does not open DuckDB and it does not call Schwab.
 from __future__ import annotations
 
 import os
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from live_view import live_view_path
@@ -298,13 +299,14 @@ function render(data) {
     : "<p class='sub'>No paper trades this session.</p>";
 }
 
-async function refresh() {
+async function refresh(retry) {
   try {
     const response = await fetch("/api/session", { cache: "no-store" });
     if (!response.ok) throw new Error("HTTP " + response.status);
     render(await response.json());
   } catch (error) {
-    document.getElementById("status").textContent = "Could not read the session file. " + error.message;
+    document.getElementById("status").textContent = "Session file busy. Retrying. " + error.message;
+    if (!retry) setTimeout(() => refresh(true), 2000);
   }
 }
 const pricePanel = document.getElementById("price-panel");
@@ -346,12 +348,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_session(self) -> None:
         path = live_view_path()
-        try:
-            with open(path, "rb") as handle:
-                body = handle.read()
-        except FileNotFoundError:
-            body = b'{"updated":null,"session_date":null,"symbol":"SPY","latest":null,"balances":{},"positions":[],"price":[],"flow":[],"pnl":[],"trades":[]}'
-        self._send(200, "application/json", body)
+        empty = b'{"updated":null,"session_date":null,"symbol":"SPY","latest":null,"balances":{},"positions":[],"price":[],"flow":[],"pnl":[],"trades":[]}'
+        body = b""
+        for attempt in range(2):
+            try:
+                with open(path, "rb") as handle:
+                    body = handle.read()
+            except FileNotFoundError:
+                body = empty
+                break
+            if body.strip():
+                break
+            if attempt == 0:
+                time.sleep(0.05)
+        self._send(200, "application/json", body or empty)
 
     def _send(self, status: int, content_type: str, body: bytes) -> None:
         self.send_response(status)

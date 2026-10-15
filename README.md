@@ -17,7 +17,7 @@ flowchart LR
 
   subgraph host [Oracle VM]
     subgraph tester [spy-forward]
-      poll[60-second poll]
+      poll[5-second chain poll]
       signals[Signal and paper fill]
       db[(DuckDB)]
       json[live_view.json]
@@ -40,7 +40,7 @@ flowchart LR
   signals --> discord
 ```
 
-A poll is one transaction. Spot, SPY bars, the 0DTE chain, and /ES bars are requested together. If the chain, the bars, or the write fails, that minute is discarded: no snapshot row and no new paper fill. The process then waits 15 seconds and doubles the wait, up to 5 minutes when nothing is open and up to 30 seconds while a 0DTE position is open. If that failure happens inside the last 10 minutes and a 0DTE position is still open, the tester paper-flattens it from the last good snapshot before sleeping. Auth failures also ping Discord with `@everyone`.
+The fast poll is the 0DTE chain. That one response carries the underlying price, so spot is not a second request. SPY minute bars refresh once a minute, /ES bars every 15 seconds, the 0–1 DTE book once a minute, and the 30–90 DTE book every 15 minutes (once a minute while a macro position is open). A quiet cycle keeps stops and flow in memory. The journal and the chart file are written once a minute, and immediately when a paper trade happens. If the chain or the write fails, that cycle is discarded: no new snapshot row and no new paper fill. The process then waits 15 seconds and doubles the wait, up to 5 minutes when nothing is open and up to 30 seconds while a 0DTE position is open. A separate thread watches the last completed poll. If that gap reaches 90 seconds with a 0DTE position still open, the tester paper-flattens it from the last good snapshot. The same flatten runs when a failure lands inside the last 10 minutes. Auth failures also ping Discord with `@everyone`. Market-data calls are paced at 1.5 per second, with a burst of four. A normal session stays near 18 requests a minute.
 
 ```mermaid
 sequenceDiagram
@@ -52,11 +52,12 @@ sequenceDiagram
   participant Chart
 
   Clock->>Tester: session open
-  loop every 60 seconds
-    Tester->>Schwab: spot, SPY and /ES 1-minute bars, 0DTE chain, 0-1 DTE GEX
+  loop every 5 seconds
+    Tester->>Schwab: 0DTE chain, including spot
+    Tester->>Schwab: SPY bars each minute, /ES bars every 15 seconds, 0-1 DTE each minute
     Tester->>Schwab: 30-90 DTE book, every 15 minutes
-    Tester->>Tester: levels, bands, signals, paper marks
-    Tester->>DuckDB: commit snapshot, trades, balances
+    Tester->>Tester: levels, bands, stops, paper marks
+    Tester->>DuckDB: commit once a minute, or immediately on a trade
     Tester->>JSON: atomic replace
   end
   Chart->>JSON: GET /api/session every minute
@@ -75,13 +76,13 @@ DuckDB allows one writer. A second connection to the live file fails, which is w
 
 ## Market data
 
-| Book | When | What it feeds |
-| --- | --- | --- |
-| SPY spot and 1-minute bars | Every poll | VWAP, 5-minute and 15-minute bars, HMM, OU |
-| /ES 1-minute bars | Every poll | Momentum price, session VWAP, and 15-minute slope. SPY closes stand in when /ES is empty |
-| 0DTE chain, 30 strikes | Every poll | Walls, zero gamma, CDF, ATM IV, intraday structures |
-| 0DTE and 1DTE chain | Every poll | `gex_0_1` magnitude |
-| 30–90 DTE chain, 50 strikes | Every 15 minutes, or every poll while a macro position is open | Macro GEX, gamma flip, the macro put spread |
+| Book | When | Requests | What it feeds |
+| --- | --- | --- | --- |
+| 0DTE chain, 30 strikes, with spot | Every 5 seconds | 12/min | Walls, zero gamma, CDF, ATM IV, intraday structures, the live spot |
+| SPY 1-minute bars | Every 60 seconds | 1/min | VWAP, 5-minute and 15-minute bars, HMM, OU, the price chart |
+| /ES 1-minute bars | Every 15 seconds | 4/min | Momentum price, session VWAP, and 15-minute slope. SPY closes stand in when /ES is empty |
+| 0DTE and 1DTE chain | Every 60 seconds | 1/min | `gex_0_1` magnitude |
+| 30–90 DTE chain, 50 strikes | Every 15 minutes, or every minute while a macro position is open | under 1/min | Macro GEX, gamma flip, the macro put spread |
 
 Schwab implied vol arrives as a percent and is stored as a decimal. Volume on the chain is already the session total, so CDF is not a cumulative sum of snapshots.
 
@@ -142,7 +143,7 @@ ATM IV is the average of the call and put implied vol at the strike nearest spot
 
 **ES momentum** is the last /ES price, /ES session VWAP, and the regression slope of the last 15 one-minute closes, in percent of the last price. When /ES bars are missing, the same three numbers are computed on SPY.
 
-**CDF** is classified share-delta on the 0DTE book. The first chain of the session sets a volume baseline. After that, only the volume increase is counted, and only when the latest sale is on the bid or the offer (Lee-Ready, with a tick test at the midpoint). A buyer of calls and a seller of puts add positive flow. Unclassified volume adds nothing.
+**CDF** is classified share-delta on the 0DTE book. The first chain of the session sets a volume baseline. After that, only the volume increase is counted. The aggressor fraction is the change in the last sale divided by half the bid-ask spread, clipped to −1…1 (bulk volume classification). A locked quote uses the sign of the spot change instead. A buyer of calls and a seller of puts add positive flow. A print that does not move adds nothing.
 
 **HMM** is a two-state Gaussian model on 1-minute returns, refit at most every 5 minutes, and immediately after a one-minute move of 0.3% or more. State 0 is the lower-variance state.
 
@@ -180,13 +181,13 @@ flowchart TD
 | Extra | ATM IV within 0.002 of the 15-minute reading. CDF moves with the fade, or is flat. A bullish fade is blocked when the 15-minute slope is below −0.05%. A bearish fade is blocked when it is above +0.05% | IV up 0.005 or 3% versus 15 minutes ago. 15-minute CDF change larger than the prior 15 minutes, and in the trade direction. /ES last price must be on the breakout side of /ES VWAP, and the slope must share that sign | Two completed 15-minute SPY closes below the macro flip. HMM state 1, or OU theta ≤ 0.005 |
 | Trigger | 5-minute test of the put wall, call wall, 1σ, or 2σ that fails to close through. A wall wins when both a wall and a band qualify | 5-minute close through `call_wall_2` on the upside, or `put_wall_2` on the downside, when that secondary wall exists. Otherwise the primary wall or zero gamma. Price must be on the correct side of SPY VWAP | The window, the two closes, and the regime above. A same-day exit does not re-enter |
 | Structure | 0DTE credit, short strike at the tested level, long strike one strike further out | 0DTE debit, about $2 wide, long strike nearest spot | 30–60 DTE put debit, about $5 wide, expiration nearest 45 DTE. Reason starts with `ENTER_MACRO_PUT_DEBIT` |
-| Stop | Live spot through the structural stop, or a loss of half the defined risk, checked every poll. An upper fade stops above `iv_max_fear_upper`. A lower fade stops below `iv_max_fear_lower`. When that fear strike is missing, a 1σ fade still uses the secondary wall | Live spot back through zero gamma, or a loss of half the defined risk | Next session: HMM back in state 0. Or, in the closing 5 minutes, spot back above the flip or macro GEX ≥ 0 |
-| Take profit | Half the credit, spot back to VWAP or zero gamma, or spot touching the IV peak center. Taken only when the close is green after fees | Spot reaches the 2σ band in the trade direction, or CDF stays flat for three polls. Taken only when the close is green after fees | The exit rules above |
+| Stop | Live spot through the structural stop, or a loss of half the defined risk, checked on each chain poll. An upper fade stops above `iv_max_fear_upper`. A lower fade stops below `iv_max_fear_lower`. When that fear strike is missing, a 1σ fade still uses the secondary wall | Live spot back through zero gamma, or a loss of half the defined risk | Next session: HMM back in state 0. Or, in the closing 5 minutes, spot back above the flip or macro GEX ≥ 0 |
+| Take profit | Half the credit, spot back to VWAP or zero gamma, or spot touching the IV peak center. Taken only when the close is green after fees | Spot reaches the 2σ band in the trade direction, or CDF stays flat for three minute-samples. Taken only when the close is green after fees | The exit rules above |
 | Flatten | Last 5 minutes | Last 5 minutes | Held overnight |
 
 A quote is skipped when the combined bid-ask width is more than `SPREAD_BA_MAX_RATIO` (default 5%) of the structure's mid value, when the premium is under $0.05, or when the credit or debit is wider than the strikes. The charm guard blocks new entries in the last hour when spot is within 0.15% of the 0DTE strike with the most open interest.
 
-A take-profit event is written only when the marked close is positive after fees. A red absorption fade, a red 2σ touch, or a red CDF reading stays open for the stop or the session flatten. Cascade's CDF exit also waits until the 15-minute change has been inside 5% of the cumulative CDF for three polls in a row. One quiet minute does not close it.
+A take-profit event is written only when the marked close is positive after fees. A red absorption fade, a red 2σ touch, or a red CDF reading stays open for the stop or the session flatten. Cascade's CDF exit also waits until the 15-minute change has been inside 5% of the cumulative CDF for three minute-samples in a row. One quiet minute does not close it.
 
 ## Paper account
 
@@ -196,7 +197,7 @@ A take-profit event is written only when the marked close is positive after fees
 | Risk | 2% of that strategy's balance |
 | Size | Whole contracts, max loss inside the risk budget, cap 25 |
 | Fees | $0.65 × contracts × legs × 2 |
-| Mark | Signed mid minus a spread factor × the summed bid-ask width on the way in, and plus that amount on the way out. Absorption and macro use `SLIPPAGE_SPREAD_FACTOR` (default 0.35). Cascade entries, stops, and flattens cross the spread (factor 1). A stop or flatten may fall back to intrinsic when quotes are missing |
+| Mark | Signed mid minus a spread factor × the summed bid-ask width on the way in, and plus that amount on the way out. Absorption and macro start at `SLIPPAGE_SPREAD_FACTOR` (default 0.35) and rise toward 0.50 when the live width exceeds the narrowest width seen, or the width stored at entry. Cascade entries, stops, and flattens cross the spread (factor 1). A stop or flatten may fall back to intrinsic when quotes are missing |
 | Reject | A debit whose fill is at least as wide as the strikes, or a credit fill of $0.05 or less, is not opened |
 | PnL | `(entry fill − closing fill) × 100 × contracts − fees`. The signed mid is short mid minus long mid, so a credit is positive. `TRADES` stores `mid_price` and `executed_fill_price` |
 
@@ -251,7 +252,7 @@ erDiagram
 
 ## Chart
 
-[http://129.146.241.140:8080/](http://129.146.241.140:8080/) polls `/api/session` once a minute, on the same cadence as the snapshot write. `/health` returns `ok`.
+[http://129.146.241.140:8080/](http://129.146.241.140:8080/) polls `/api/session` once a minute. A failed read keeps the last chart and retries once. `/health` returns `ok`.
 
 | Series | Drawing |
 | --- | --- |
